@@ -487,8 +487,8 @@ Giá hiện tại (M5): `{price:.2f}`
 *Trend higher timeframe:*
 - 1H: `{t1h}` (Close: {c1h['close']:.2f})
 - 2H: `{t2h}` (Close: {c2h['close']:.2f})
-#- 4H: `{t4h}` (Close: {c4h['close']:.2f})
-#- 1D: `{t1d}` (Close: {c1d['close']:.2f})
+- 4H: `{t4h}` (Close: {c4h['close']:.2f})
+- 1D: `{t1d}` (Close: {c1d['close']:.2f})
 → *Trend chính:* `{main_trend}`
 
 *Khung M5:*
@@ -497,8 +497,7 @@ Giá hiện tại (M5): `{price:.2f}`
 - ATR14 M5: `{last5['atr14']:.2f}`
 
 *Khung xác nhận:*
-- M15 trend: `{trend_m15}`
-- M30 trend: `{trend_m30}`
+- M15 trend: `{trend_m15}` - M30 trend: `{trend_m30}`
 
 *Tín hiệu sau khi lọc:* {filtered_signal}
 {recommendation}
