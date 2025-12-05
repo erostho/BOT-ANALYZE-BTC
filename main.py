@@ -769,9 +769,9 @@ def analyze_and_build_message():
     }.get(ms_30m, ms_30m)
 
     msg = f"""
-✅✅✅ *BTC UPDATE (OKX: {OKX_SYMBOL})*
+✅✅✅ *UPDATE INFO ({OKX_SYMBOL})*
 Thời gian: `{now_str}`
-Giá EXNESS (quy đổi): `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
+Giá EXNESS: `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
 
 *Trend higher timeframe (cache):*
 - Trend 30m: `{trend_30m}`
@@ -787,11 +787,10 @@ Giá EXNESS (quy đổi): `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f
 *Khung 15m (khung trade chính):*
 - {force}
 - Tín hiệu: *{signal}*
-- Khuyến nghị: {recommendation}
+- {recommendation}
 - ATR14 15m: `{atr_str}`
   → {classify_atr(atr)}
-- RSI14 15m: `{rsi_str}`
-- Chế độ thị trường: `{regime}`
+- RSI14 15m: `{rsi_str}`- Chế độ TT: `{regime}`
 - Độ sâu nhịp hồi/điều chỉnh: {pullback_comment}
 
 - {session_note}
@@ -823,10 +822,9 @@ Giá EXNESS (quy đổi): `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f
 - TP (OKX): `{trade['tp']}`
 - SL (OKX): `{trade['sl']}`
 
-- Entry dự kiến trên EXNESS: `{ex_entry}`
-- TP dự kiến trên EXNESS: `{ex_tp}`
-- SL dự kiến trên EXNESS: `{ex_sl}`
-(ATR14 15m ≈ `{trade['atr']}`)
+- Entry EXNESS: `{ex_entry}`
+- TP EXNESS: `{ex_tp}`
+- SL EXNESS: `{ex_sl}`
 """
 
     # ---- Signature chống spam ----
