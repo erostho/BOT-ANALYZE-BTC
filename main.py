@@ -578,13 +578,13 @@ def analyze_and_build_message():
     - 2H: `{t2h}` (Close: {c2h['close']:.2f})
     - 4H: `{t4h}` (Close: {c4h['close']:.2f})
     → *Trend chính (ưu tiên 4H):* `{main_trend}`
+    *Khung 30m (tham khảo):*- Trend 30m: `{trend_30m}`    
     
     *Khung 15m (khung trade chính):*
     - {force}
     - Tín hiệu: *{signal}*
-    - Khuyến nghị: {recommendation}
+    - {recommendation}
     - ATR14 15m: `{atr_str}`"""
-
 
     if retrace_info:
         if retrace_info["direction"] == "UP":
@@ -597,8 +597,7 @@ def analyze_and_build_message():
 
     msg += f"""
 
-*Khung 30m (tham khảo):*
-- Trend 30m: `{trend_30m}`
+
 """
 
     if trade:
@@ -617,7 +616,6 @@ def analyze_and_build_message():
     - Entry dự kiến trên EXNESS: `{ex_entry}`
     - TP dự kiến trên EXNESS: `{ex_tp}`
     - SL dự kiến trên EXNESS: `{ex_sl}`
-    (ATR14 15m ≈ `{trade['atr']}`)
     """
 
 
