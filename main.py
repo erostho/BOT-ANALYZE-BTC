@@ -569,16 +569,15 @@ def analyze_and_build_message():
     msg = f"""
     *✅✅✅BTC UPDATE (OKX: {OKX_SYMBOL})*
     Thời gian: `{now_str}`
-    #Giá hiện tại (OKX 15m): `{price:.2f}`
     Giá EXNESS: `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
     
     *Trend higher timeframe (cache):*
+    - Trend 30m: `{trend_30m}`       
     - 1H: `{t1h}` (Close: {c1h['close']:.2f})
     - 2H: `{t2h}` (Close: {c2h['close']:.2f})
     - 4H: `{t4h}` (Close: {c4h['close']:.2f})
     → *Trend chính (ưu tiên 4H):* `{main_trend}`
-    *Khung 30m (tham khảo):*- Trend 30m: `{trend_30m}`    
-    
+
     *Khung 15m (khung trade chính):*
     - {force}
     - Tín hiệu: *{signal}*
@@ -595,26 +594,17 @@ def analyze_and_build_message():
             msg += f"\n  • {label}: `{z_low:.2f} – {z_high:.2f}`"
 
     msg += f"""
-
-
 """
-
     if trade:
         ex_entry = to_exness_price(trade["entry"])
         ex_tp = to_exness_price(trade["tp"])
         ex_sl = to_exness_price(trade["sl"])
-    
         msg += f"""
     *🎯 Gợi ý lệnh (ATR-based 15m):*
-    - Lệnh: **{trade['side']}**
-    
-    - Entry (OKX): `{trade['entry']}`
-    - TP (OKX): `{trade['tp']}`
-    - SL (OKX): `{trade['sl']}`
-    
-    - Entry dự kiến trên EXNESS: `{ex_entry}`
-    - TP dự kiến trên EXNESS: `{ex_tp}`
-    - SL dự kiến trên EXNESS: `{ex_sl}`
+    - Lệnh: **{trade['side']}**    
+        - Entry: `{ex_entry}`
+        - TP: `{ex_tp}`
+        - SL: `{ex_sl}`
     """
 
 
