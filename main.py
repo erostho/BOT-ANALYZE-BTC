@@ -77,7 +77,6 @@ def get_state_sheet():
 
 
 def read_cache_row(ws, tf):
-    """Lấy 1 dòng theo timeframe (mỗi TF chỉ 1 dòng)."""
     rows = ws.get_all_records()
     for row in rows:
         if str(row.get("timeframe")) == tf:
@@ -94,7 +93,7 @@ def upsert_cache_row(ws, tf, close_time_str, o, h, l, c, v):
     rows = ws.get_all_records()
     target_idx = None
 
-    for i, row in enumerate(rows, start=2):  # get_all_records bắt đầu từ row 2
+    for i, row in enumerate(rows, start=2):
         if str(row.get("timeframe")) == tf:
             target_idx = i
             break
@@ -254,9 +253,11 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID,
-               "text": text,
-               "parse_mode": "Markdown"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
 
     try:
         requests.post(url, json=payload, timeout=10)
@@ -292,7 +293,6 @@ def build_trade_suggestion(signal: str, last: pd.Series):
         return None
 
     price = last["close"]
-    ema20 = last["ema20"]
 
     if "LONG" in signal:
         side = "LONG"
@@ -309,7 +309,7 @@ def build_trade_suggestion(signal: str, last: pd.Series):
         SL_ATR = 1.0
         TP_RR = 2.0
 
-    entry = price  # có thể thay bằng ema20 nếu bạn thích
+    entry = price  # có thể chỉnh về EMA nếu muốn
 
     if side == "LONG":
         sl = entry - SL_ATR * atr
@@ -349,6 +349,76 @@ def build_recommendation(signal: str, trend: str) -> str:
     if trend == "UP":
         return "Khuyến nghị: Ưu tiên tìm điểm LONG, hạn chế SHORT dài."
     return "Khuyến nghị: Thị trường sideway, ưu tiên đứng ngoài."
+
+
+def build_retrace_zones(main_trend: str, signal: str,
+                        df15: pd.DataFrame,
+                        df30: pd.DataFrame,
+                        c1h: dict,
+                        atr: float):
+    """
+    Trả về dict:
+      {
+        "direction": "UP" or "DOWN",
+        "zones": [(label, (low, high)), ...]
+      }
+    hoặc None nếu không phải sóng hồi / thiếu dữ liệu.
+    """
+    if atr is None or pd.isna(atr):
+        return None
+
+    # chỉ tính cho các trạng thái sóng hồi / chờ hồi
+    is_down_retrace = (
+        main_trend == "DOWN" and
+        (signal in ["LONG hồi kỹ thuật", "Chờ SHORT lại"])
+    )
+    is_up_retrace = (
+        main_trend == "UP" and
+        (signal in ["SHORT hồi kỹ thuật", "Chờ LONG lại"])
+    )
+
+    if not (is_down_retrace or is_up_retrace):
+        return None
+
+    try:
+        width = 0.4 * float(atr)  # biên mỗi vùng ~0.4 ATR
+
+        if is_down_retrace:
+            # Hồi lên trong Downtrend
+            recent_high_15 = df15["high"].iloc[-10:-1].max()
+            recent_high_30 = df30["high"].iloc[-6:-1].max()
+            high_1h = float(c1h["high"])
+
+            def z(center):
+                return (round(center - width, 2), round(center + width, 2))
+
+            zones = [
+                ("Vùng 1", z(recent_high_15)),
+                ("Vùng 2", z(recent_high_30)),
+                ("Vùng 3 (thấp)", z(high_1h)),
+            ]
+            return {"direction": "UP", "zones": zones}
+
+        if is_up_retrace:
+            # Điều chỉnh xuống trong Uptrend
+            recent_low_15 = df15["low"].iloc[-10:-1].min()
+            recent_low_30 = df30["low"].iloc[-6:-1].min()
+            low_1h = float(c1h["low"])
+
+            def z(center):
+                return (round(center - width, 2), round(center + width, 2))
+
+            zones = [
+                ("Vùng 1", z(recent_low_15)),
+                ("Vùng 2", z(recent_low_30)),
+                ("Vùng 3 (thấp)", z(low_1h)),
+            ]
+            return {"direction": "DOWN", "zones": zones}
+
+    except Exception as e:
+        print("Error build_retrace_zones:", repr(e))
+
+    return None
 
 
 # =========================
@@ -392,6 +462,7 @@ def analyze_and_build_message():
 
     price = last["close"]
     atr = last["atr14"]
+    atr_str = f"{atr:.2f}" if not pd.isna(atr) else "N/A"
 
     # lưu nến 15m cuối vào cache để theo dõi
     upsert_cache_row(
@@ -484,6 +555,9 @@ def analyze_and_build_message():
     if "LONG" in signal or "SHORT" in signal:
         trade = build_trade_suggestion(signal, last)
 
+    # ---- Các vùng hồi / điều chỉnh ----
+    retrace_info = build_retrace_zones(main_trend, signal, df15, df30, c1h, atr)
+
     # ---- Message ----
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -502,7 +576,18 @@ Giá hiện tại (15m): `{price:.2f}`
 - {force}
 - Tín hiệu: *{signal}*
 - Khuyến nghị: {recommendation}
-- ATR14 15m: `{atr:.2f if not pd.isna(atr) else 'N/A'}`
+- ATR14 15m: `{atr_str}`"""
+
+    if retrace_info:
+        if retrace_info["direction"] == "UP":
+            msg += "\n↗ *Khả năng hồi lên các vùng:*"
+        else:
+            msg += "\n↘ *Khả năng điều chỉnh về các vùng:*"
+
+        for label, (z_low, z_high) in retrace_info["zones"]:
+            msg += f"\n  • {label}: `{z_low:.2f} – {z_high:.2f}`"
+
+    msg += f"""
 
 *Khung 30m (tham khảo):*
 - Trend 30m: `{trend_30m}`
