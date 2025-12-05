@@ -333,9 +333,9 @@ def build_trade_suggestion(signal: str, last: pd.Series):
 
 def build_recommendation(signal: str, trend: str) -> str:
     if signal == "SHORT mạnh":
-        return "Khuyến nghị: SHORT mạnh theo xu hướng. TP xa, có thể giữ lệnh."
+        return "Khuyến nghị: ⭐ SHORT mạnh theo xu hướng. TP xa, có thể giữ lệnh."
     if signal == "LONG mạnh":
-        return "Khuyến nghị: LONG mạnh theo xu hướng. TP xa, có thể giữ lệnh."
+        return "Khuyến nghị: ⭐ LONG mạnh theo xu hướng. TP xa, có thể giữ lệnh."
 
     if signal == "LONG hồi kỹ thuật":
         return "Khuyến nghị: LONG nhẹ (scalp). TP gần. Không giữ lâu vì ngược xu hướng."
