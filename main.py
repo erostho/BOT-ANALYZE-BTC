@@ -353,6 +353,21 @@ def build_recommendation(signal: str, trend: str) -> str:
     if trend == "UP":
         return "Khuyến nghị: Ưu tiên tìm điểm LONG, hạn chế SHORT dài."
     return "Khuyến nghị: Thị trường sideway, ưu tiên đứng ngoài."
+    
+def classify_atr(atr: float) -> str:
+    if atr is None or pd.isna(atr):
+        return "Không xác định"
+
+    if atr < 150:
+        return "Sideway nhẹ, dao động nhỏ"
+    elif atr < 250:
+        return "Biến động vừa"
+    elif atr < 350:
+        return "Thị trường bắt đầu mạnh"
+    elif atr < 600:
+        return "Trend mạnh, breakout mạnh"
+    else:
+        return "Biến động cực mạnh (thường khi tin tức)"
 
 
 def build_retrace_zones(main_trend: str, signal: str,
@@ -582,19 +597,22 @@ def analyze_and_build_message():
     - {force}
     - Tín hiệu: *{signal}*
     - {recommendation}
-    - ATR14 15m: `{atr_str}`"""
+    - ATR14 15m: `{atr_str}`
+      → {classify_atr(atr)}
 
     if retrace_info:
         if retrace_info["direction"] == "UP":
-            msg += "\n↗ *Khả năng hồi lên các vùng:*"
+            msg += "\n*Khả năng hồi lên các vùng (EXNESS):*"
         else:
-            msg += "\n↘ *Khả năng điều chỉnh về các vùng:*"
-
+            msg += "\n*Khả năng điều chỉnh về các vùng (EXNESS):*"
+    
         for label, (z_low, z_high) in retrace_info["zones"]:
-            msg += f"\n  • {label}: `{z_low:.2f} – {z_high:.2f}`"
-
-    msg += f"""
-"""
+            ex_low = to_exness_price(z_low)
+            ex_high = to_exness_price(z_high)
+            msg += f"\n• {label}: {ex_low:.2f} – {ex_high:.2f}"
+    
+        msg += f"""
+    """
     if trade:
         ex_entry = to_exness_price(trade["entry"])
         ex_tp = to_exness_price(trade["tp"])
@@ -606,7 +624,6 @@ def analyze_and_build_message():
         - TP: `{ex_tp}`
         - SL: `{ex_sl}`
     """
-
 
     # ---- Signature chống spam ----
     trade_side = trade["side"] if trade else "NONE"
