@@ -21,6 +21,7 @@ GOOGLE_SHEET_WORKSHEET = os.environ.get("GOOGLE_SHEET_WORKSHEET", "CANDLES")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+EXNESS_PRICE_OFFSET = float(os.environ.get("EXNESS_PRICE_OFFSET", "0"))
 
 TIMEFRAMES = {
     "15m": "15m",
@@ -34,6 +35,9 @@ TIMEFRAMES = {
 # =========================
 # GOOGLE SHEETS
 # =========================
+def to_exness_price(px: float) -> float:
+    """Quy đổi giá OKX sang giá tương đương trên Exness bằng offset cố định."""
+    return round(px + EXNESS_PRICE_OFFSET, 2)
 
 def _get_gsheet_client():
     if not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
@@ -560,23 +564,27 @@ def analyze_and_build_message():
 
     # ---- Message ----
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
+    exness_price = to_exness_price(price)
+    
     msg = f"""
-*BTC UPDATE (OKX: {OKX_SYMBOL})*
-Thời gian: `{now_str}`
-Giá hiện tại (15m): `{price:.2f}`
+    *BTC UPDATE (OKX: {OKX_SYMBOL})*
+    Thời gian: `{now_str}`
+    
+    Giá hiện tại (OKX 15m): `{price:.2f}`
+    Giá quy đổi sang EXNESS: `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
+    
+    *Trend higher timeframe (cache):*
+    - 1H: `{t1h}` (Close: {c1h['close']:.2f})
+    - 2H: `{t2h}` (Close: {c2h['close']:.2f})
+    - 4H: `{t4h}` (Close: {c4h['close']:.2f})
+    → *Trend chính (ưu tiên 4H):* `{main_trend}`
+    
+    *Khung 15m (khung trade chính):*
+    - {force}
+    - Tín hiệu: *{signal}*
+    - Khuyến nghị: {recommendation}
+    - ATR14 15m: `{atr_str}`"""
 
-*Trend higher timeframe (cache):*
-- 1H: `{t1h}` (Close: {c1h['close']:.2f})
-- 2H: `{t2h}` (Close: {c2h['close']:.2f})
-- 4H: `{t4h}` (Close: {c4h['close']:.2f})
-→ *Trend chính (ưu tiên 4H):* `{main_trend}`
-
-*Khung 15m (khung trade chính):*
-- {force}
-- Tín hiệu: *{signal}*
-- Khuyến nghị: {recommendation}
-- ATR14 15m: `{atr_str}`"""
 
     if retrace_info:
         if retrace_info["direction"] == "UP":
@@ -594,14 +602,24 @@ Giá hiện tại (15m): `{price:.2f}`
 """
 
     if trade:
+        ex_entry = to_exness_price(trade["entry"])
+        ex_tp = to_exness_price(trade["tp"])
+        ex_sl = to_exness_price(trade["sl"])
+    
         msg += f"""
-*🎯 Gợi ý lệnh (ATR-based 15m):*
-- Lệnh: **{trade['side']}**
-- Entry: `{trade['entry']}`
-- TP: `{trade['tp']}`
-- SL: `{trade['sl']}`
-(ATR14 15m ≈ `{trade['atr']}`)
-"""
+    *🎯 Gợi ý lệnh (ATR-based 15m):*
+    - Lệnh: **{trade['side']}**
+    
+    - Entry (OKX): `{trade['entry']}`
+    - TP (OKX): `{trade['tp']}`
+    - SL (OKX): `{trade['sl']}`
+    
+    - Entry dự kiến trên EXNESS: `{ex_entry}`
+    - TP dự kiến trên EXNESS: `{ex_tp}`
+    - SL dự kiến trên EXNESS: `{ex_sl}`
+    (ATR14 15m ≈ `{trade['atr']}`)
+    """
+
 
     # ---- Signature chống spam ----
     trade_side = trade["side"] if trade else "NONE"
