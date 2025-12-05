@@ -567,11 +567,10 @@ def analyze_and_build_message():
     exness_price = to_exness_price(price)
     
     msg = f"""
-    *BTC UPDATE (OKX: {OKX_SYMBOL})*
+    *✅✅✅BTC UPDATE (OKX: {OKX_SYMBOL})*
     Thời gian: `{now_str}`
-    
-    Giá hiện tại (OKX 15m): `{price:.2f}`
-    Giá quy đổi sang EXNESS: `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
+    #Giá hiện tại (OKX 15m): `{price:.2f}`
+    Giá EXNESS: `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
     
     *Trend higher timeframe (cache):*
     - 1H: `{t1h}` (Close: {c1h['close']:.2f})
