@@ -21,6 +21,9 @@ GOOGLE_SHEET_WORKSHEET = os.environ.get("GOOGLE_SHEET_WORKSHEET", "CANDLES")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# OFFSET giữa giá OKX và EXNESS
+# EXNESS_PRICE_OFFSET = Giá_EXNESS - Giá_OKX (VD: 60 nghĩa là Exness cao hơn OKX 60$)
 EXNESS_PRICE_OFFSET = float(os.environ.get("EXNESS_PRICE_OFFSET", "0"))
 
 TIMEFRAMES = {
@@ -32,12 +35,14 @@ TIMEFRAMES = {
 }
 
 
-# =========================
-# GOOGLE SHEETS
-# =========================
 def to_exness_price(px: float) -> float:
     """Quy đổi giá OKX sang giá tương đương trên Exness bằng offset cố định."""
     return round(px + EXNESS_PRICE_OFFSET, 2)
+
+
+# =========================
+# GOOGLE SHEETS
+# =========================
 
 def _get_gsheet_client():
     if not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
@@ -271,7 +276,7 @@ def send_telegram(text: str):
 
 
 # =========================
-# TREND & SIGNAL LOGIC
+# INDICATORS & ANALYSIS HELPERS
 # =========================
 
 def detect_simple_trend_from_candle(candle: dict) -> str:
@@ -280,6 +285,14 @@ def detect_simple_trend_from_candle(candle: dict) -> str:
     if candle["close"] < candle["open"]:
         return "DOWN"
     return "SIDEWAY"
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 
 def detect_tf_trend(df: pd.DataFrame) -> str:
@@ -291,7 +304,124 @@ def detect_tf_trend(df: pd.DataFrame) -> str:
     return "SIDEWAY"
 
 
-def build_trade_suggestion(signal: str, last: pd.Series):
+def classify_atr(atr: float) -> str:
+    if atr is None or pd.isna(atr):
+        return "Không xác định"
+
+    if atr < 150:
+        return "Sideway nhẹ, dao động nhỏ"
+    elif atr < 250:
+        return "Biến động vừa"
+    elif atr < 350:
+        return "Thị trường bắt đầu mạnh"
+    elif atr < 600:
+        return "Trend mạnh, breakout mạnh"
+    else:
+        return "Biến động cực mạnh (thường khi tin tức)"
+
+
+def detect_market_structure(df: pd.DataFrame, lookback: int = 40) -> str:
+    """
+    Market structure cơ bản dựa vào swing high/low gần nhất.
+    Trả về: "UP", "DOWN", "RANGE"
+    """
+    if len(df) < lookback:
+        lookback = len(df)
+
+    sub = df.iloc[-lookback:]
+    highs = sub["high"]
+    lows = sub["low"]
+
+    # swing high/low đơn giản: local max/min với window=2
+    swing_high_idx = []
+    swing_low_idx = []
+    for i in range(2, len(sub) - 2):
+        if highs.iloc[i] > highs.iloc[i - 1] and highs.iloc[i] > highs.iloc[i + 1]:
+            swing_high_idx.append(sub.index[i])
+        if lows.iloc[i] < lows.iloc[i - 1] and lows.iloc[i] < lows.iloc[i + 1]:
+            swing_low_idx.append(sub.index[i])
+
+    if len(swing_high_idx) < 2 or len(swing_low_idx) < 2:
+        return "RANGE"
+
+    last_two_highs = highs.loc[swing_high_idx[-2:]]
+    last_two_lows = lows.loc[swing_low_idx[-2:]]
+
+    # HH-HL
+    if last_two_highs.iloc[1] > last_two_highs.iloc[0] and last_two_lows.iloc[1] > last_two_lows.iloc[0]:
+        return "UP"
+
+    # LH-LL
+    if last_two_highs.iloc[1] < last_two_highs.iloc[0] and last_two_lows.iloc[1] < last_two_lows.iloc[0]:
+        return "DOWN"
+
+    return "RANGE"
+
+
+def compute_pullback_quality(main_trend: str, df: pd.DataFrame) -> str:
+    """
+    Dựa trên sóng gần nhất & vị trí giá hiện tại để nói:
+    - "Hồi nông"
+    - "Hồi vừa"
+    - "Hồi sâu, cẩn thận đảo chiều"
+    - "Có nguy cơ đảo chiều xu hướng"
+    Chỉ dùng để mô tả, không đổi logic entry.
+    """
+    if len(df) < 30:
+        return "Không đủ dữ liệu đánh giá độ sâu nhịp hồi"
+
+    sub = df.iloc[-40:]
+    last = sub.iloc[-1]
+
+    # cố gắng lấy swing gần nhất: high & low của 20 nến trước
+    prior = sub.iloc[:-1]
+    swing_high = prior["high"].max()
+    swing_low = prior["low"].min()
+    price = last["close"]
+
+    if main_trend == "DOWN":
+        # sóng chính: từ swing_high -> swing_low, hiện tại đang hồi lên từ low
+        full_range = swing_high - swing_low
+        if full_range <= 0:
+            return "Không xác định độ sâu nhịp hồi"
+        retrace = price - swing_low
+        ratio = retrace / full_range
+    elif main_trend == "UP":
+        full_range = swing_high - swing_low
+        if full_range <= 0:
+            return "Không xác định độ sâu nhịp điều chỉnh"
+        retrace = swing_high - price
+        ratio = retrace / full_range
+    else:
+        return "Thị trường không có trend rõ, pullback khó đánh giá"
+
+    if ratio < 0.25:
+        return "Nhịp hồi/điều chỉnh còn nông"
+    elif ratio < 0.5:
+        return "Nhịp hồi/điều chỉnh ở mức vừa"
+    elif ratio < 0.75:
+        return "Nhịp hồi/điều chỉnh sâu, cẩn thận đảo chiều"
+    else:
+        return "Giá đã hồi/điều chỉnh rất sâu, có nguy cơ đảo chiều xu hướng"
+
+
+def classify_regime(atr: float, ema_dist: float) -> str:
+    """
+    Dùng ATR & khoảng cách EMA20-EMA50 / giá để chia:
+    - TREND
+    - SIDEWAY
+    """
+    if atr is None or pd.isna(atr):
+        return "UNKNOWN"
+
+    if ema_dist < 0.0015 and atr < 180:
+        return "SIDEWAY"
+    if ema_dist > 0.003 or atr > 250:
+        return "TREND"
+    return "MIXED"
+
+
+def build_trade_suggestion(signal: str, last: pd.Series, regime: str):
     atr = last.get("atr14")
     if atr is None or pd.isna(atr):
         return None
@@ -310,10 +440,11 @@ def build_trade_suggestion(signal: str, last: pd.Series):
         SL_ATR = 0.7
         TP_RR = 1.2
     else:
+        # nếu đúng TREND mode thì cho TP xa hơn
         SL_ATR = 1.0
-        TP_RR = 2.0
+        TP_RR = 2.2 if regime == "TREND" else 2.0
 
-    entry = price  # có thể chỉnh về EMA nếu muốn
+    entry = price
 
     if side == "LONG":
         sl = entry - SL_ATR * atr
@@ -331,43 +462,30 @@ def build_trade_suggestion(signal: str, last: pd.Series):
     }
 
 
-def build_recommendation(signal: str, trend: str) -> str:
+def build_recommendation(signal: str, main_trend: str, regime: str, rsi_value: float) -> str:
+    if regime == "SIDEWAY":
+        return "Thị trường đang sideway, ưu tiên đứng ngoài hoặc chỉ scalp rất ngắn."
+
     if signal == "SHORT mạnh":
-        return "Khuyến nghị: ⭐ SHORT mạnh theo xu hướng. TP xa, có thể giữ lệnh."
+        return "Khuyến nghị: SHORT mạnh theo xu hướng chính. TP xa, có thể giữ lệnh."
     if signal == "LONG mạnh":
-        return "Khuyến nghị: ⭐ LONG mạnh theo xu hướng. TP xa, có thể giữ lệnh."
+        return "Khuyến nghị: LONG mạnh theo xu hướng chính. TP xa, có thể giữ lệnh."
 
     if signal == "LONG hồi kỹ thuật":
-        return "Khuyến nghị: LONG nhẹ (scalp). TP gần. Không giữ lâu vì ngược xu hướng."
+        return "Khuyến nghị: LONG nhẹ (scalp) ngược xu hướng. TP gần, không giữ lâu."
     if signal == "SHORT hồi kỹ thuật":
-        return "Khuyến nghị: SHORT nhẹ (scalp). TP gần. Không giữ lâu vì ngược xu hướng."
+        return "Khuyến nghị: SHORT nhẹ (scalp) ngược xu hướng. TP gần, không giữ lâu."
 
     if signal == "Chờ SHORT lại":
         return "Khuyến nghị: Nhịp hồi kỹ thuật trong Downtrend – chờ giá lên vùng cản rồi SHORT lại."
     if signal == "Chờ LONG lại":
         return "Khuyến nghị: Nhịp điều chỉnh trong Uptrend – chờ giá điều chỉnh xong rồi LONG lại."
 
-    # fallback
-    if trend == "DOWN":
+    if main_trend == "DOWN":
         return "Khuyến nghị: Ưu tiên tìm điểm SHORT, hạn chế LONG dài."
-    if trend == "UP":
+    if main_trend == "UP":
         return "Khuyến nghị: Ưu tiên tìm điểm LONG, hạn chế SHORT dài."
-    return "Khuyến nghị: Thị trường sideway, ưu tiên đứng ngoài."
-    
-def classify_atr(atr: float) -> str:
-    if atr is None or pd.isna(atr):
-        return "Không xác định"
-
-    if atr < 150:
-        return "Sideway nhẹ, dao động nhỏ"
-    elif atr < 250:
-        return "Biến động vừa"
-    elif atr < 350:
-        return "Thị trường bắt đầu mạnh"
-    elif atr < 600:
-        return "Trend mạnh, breakout mạnh"
-    else:
-        return "Biến động cực mạnh (thường khi tin tức)"
+    return "Khuyến nghị: Thị trường không rõ xu hướng, ưu tiên đứng ngoài."
 
 
 def build_retrace_zones(main_trend: str, signal: str,
@@ -386,7 +504,6 @@ def build_retrace_zones(main_trend: str, signal: str,
     if atr is None or pd.isna(atr):
         return None
 
-    # chỉ tính cho các trạng thái sóng hồi / chờ hồi
     is_down_retrace = (
         main_trend == "DOWN" and
         (signal in ["LONG hồi kỹ thuật", "Chờ SHORT lại"])
@@ -400,10 +517,9 @@ def build_retrace_zones(main_trend: str, signal: str,
         return None
 
     try:
-        width = 0.4 * float(atr)  # biên mỗi vùng ~0.4 ATR
+        width = 0.4 * float(atr)
 
         if is_down_retrace:
-            # Hồi lên trong Downtrend
             recent_high_15 = df15["high"].iloc[-10:-1].max()
             recent_high_30 = df30["high"].iloc[-6:-1].max()
             high_1h = float(c1h["high"])
@@ -419,7 +535,6 @@ def build_retrace_zones(main_trend: str, signal: str,
             return {"direction": "UP", "zones": zones}
 
         if is_up_retrace:
-            # Điều chỉnh xuống trong Uptrend
             recent_low_15 = df15["low"].iloc[-10:-1].min()
             recent_low_30 = df30["low"].iloc[-6:-1].min()
             low_1h = float(c1h["low"])
@@ -438,6 +553,22 @@ def build_retrace_zones(main_trend: str, signal: str,
         print("Error build_retrace_zones:", repr(e))
 
     return None
+
+
+def build_session_note(now_utc: datetime) -> str:
+    """
+    Gợi ý phiên theo giờ Việt Nam (UTC+7), không khóa lệnh.
+    - 12h–2h sáng VN: phiên Âu/Mỹ -> sôi động
+    - 3h–7h VN: giờ "chết" -> nhắc giảm khối lượng
+    """
+    vn_time = now_utc + timedelta(hours=7)
+    h = vn_time.hour
+
+    if 13 <= h <= 23:
+        return f"Giờ VN {vn_time.strftime('%H:%M')} – phiên Âu/Mỹ, thị trường thường sôi động."
+    if 3 <= h <= 7:
+        return f"Giờ VN {vn_time.strftime('%H:%M')} – thanh khoản thường thấp, cân nhắc giảm khối lượng."
+    return f"Giờ VN {vn_time.strftime('%H:%M')}."
 
 
 # =========================
@@ -474,6 +605,7 @@ def analyze_and_build_message():
     df15["tr3"] = (df15["low"] - df15["prev_close"]).abs()
     df15["tr"] = df15[["tr1", "tr2", "tr3"]].max(axis=1)
     df15["atr14"] = df15["tr"].rolling(14).mean()
+    df15["rsi14"] = rsi(df15["close"], 14)
 
     last = df15.iloc[-1]
     prev1 = df15.iloc[-2]
@@ -482,6 +614,8 @@ def analyze_and_build_message():
     price = last["close"]
     atr = last["atr14"]
     atr_str = f"{atr:.2f}" if not pd.isna(atr) else "N/A"
+    rsi_val = float(last["rsi14"]) if not pd.isna(last["rsi14"]) else None
+    rsi_str = f"{rsi_val:.1f}" if rsi_val is not None else "N/A"
 
     # lưu nến 15m cuối vào cache để theo dõi
     upsert_cache_row(
@@ -513,6 +647,17 @@ def analyze_and_build_message():
         last30["volume"],
     )
 
+    # ---- Market structure 15m & 30m ----
+    ms_15m = detect_market_structure(df15)
+    ms_30m = detect_market_structure(df30)
+
+    # ---- Regime: TREND / SIDEWAY / MIXED ----
+    ema_dist = abs(last["ema20"] - last["ema50"]) / last["close"]
+    regime = classify_regime(atr, ema_dist)
+
+    # ---- Pullback quality (theo trend chính) ----
+    pullback_comment = compute_pullback_quality(main_trend, df15)
+
     # ---- Xác định tín hiệu trên 15m ----
     def is_bull(row):
         return row["close"] > row["open"]
@@ -542,92 +687,151 @@ def analyze_and_build_message():
 
     # DOWN trend logic
     if main_trend == "DOWN":
-        if is_bear(last) and last["close"] < last["ema20"] < last["ema50"] and big_move and vol_ok:
-            force = "Lực bán chiếm ưu thế trong Downtrend"
-            signal = "SHORT mạnh"
-        elif three_bull and last["close"] > last["ema20"] and moderate_move:
-            force = "Nhịp hồi kỹ thuật trong Downtrend"
-            signal = "LONG hồi kỹ thuật"
+        if regime == "TREND" and ms_15m == "DOWN":
+            if is_bear(last) and last["close"] < last["ema20"] < last["ema50"] and big_move and vol_ok:
+                # RSI filter: tránh short khi RSI quá thấp (quá bán cực mạnh)
+                if rsi_val is not None and rsi_val < 20:
+                    force = "Đang quá bán mạnh, cẩn trọng với lệnh SHORT mới"
+                    signal = "Chờ SHORT lại"
+                else:
+                    force = "Lực bán chiếm ưu thế trong Downtrend"
+                    signal = "SHORT mạnh"
+            elif three_bull and last["close"] > last["ema20"] and moderate_move:
+                force = "Nhịp hồi kỹ thuật trong Downtrend"
+                signal = "LONG hồi kỹ thuật"
+            else:
+                force = "Nhịp hồi kỹ thuật trong Downtrend"
+                signal = "Chờ SHORT lại"
         else:
-            force = "Nhịp hồi kỹ thuật trong Downtrend"
-            signal = "Chờ SHORT lại"
+            # trend yếu hoặc sideway => hạn chế SHORT mạnh
+            if three_bull and last["close"] > last["ema20"] and moderate_move:
+                force = "Nhịp hồi kỹ thuật trong Downtrend yếu"
+                signal = "LONG hồi kỹ thuật"
+            else:
+                force = "Downtrend nhưng cấu trúc yếu/sideway"
+                signal = "Chờ SHORT lại"
 
     # UP trend logic
     elif main_trend == "UP":
-        if is_bull(last) and last["close"] > last["ema20"] > last["ema50"] and big_move and vol_ok:
-            force = "Lực mua chiếm ưu thế trong Uptrend"
-            signal = "LONG mạnh"
-        elif three_bear and last["close"] < last["ema20"] and moderate_move:
-            force = "Nhịp điều chỉnh giảm trong Uptrend"
-            signal = "SHORT hồi kỹ thuật"
+        if regime == "TREND" and ms_15m == "UP":
+            if is_bull(last) and last["close"] > last["ema20"] > last["ema50"] and big_move and vol_ok:
+                # RSI filter: tránh long khi RSI quá cao (quá mua cực mạnh)
+                if rsi_val is not None and rsi_val > 80:
+                    force = "Đang quá mua mạnh, cẩn trọng với lệnh LONG mới"
+                    signal = "Chờ LONG lại"
+                else:
+                    force = "Lực mua chiếm ưu thế trong Uptrend"
+                    signal = "LONG mạnh"
+            elif three_bear and last["close"] < last["ema20"] and moderate_move:
+                force = "Nhịp điều chỉnh giảm trong Uptrend"
+                signal = "SHORT hồi kỹ thuật"
+            else:
+                force = "Nhịp điều chỉnh giảm trong Uptrend"
+                signal = "Chờ LONG lại"
         else:
-            force = "Nhịp điều chỉnh giảm trong Uptrend"
-            signal = "Chờ LONG lại"
+            if three_bear and last["close"] < last["ema20"] and moderate_move:
+                force = "Nhịp điều chỉnh trong Uptrend yếu"
+                signal = "SHORT hồi kỹ thuật"
+            else:
+                force = "Uptrend nhưng cấu trúc yếu/sideway"
+                signal = "Chờ LONG lại"
 
     else:
         force = "Thị trường sideway"
         signal = "Sideway – ưu tiên đứng ngoài"
 
     # ---- Gợi ý lệnh & khuyến nghị ----
-    recommendation = build_recommendation(signal, main_trend)
+    recommendation = build_recommendation(signal, main_trend, regime, rsi_val)
     trade = None
     if "LONG" in signal or "SHORT" in signal:
-        trade = build_trade_suggestion(signal, last)
+        trade = build_trade_suggestion(signal, last, regime)
 
     # ---- Các vùng hồi / điều chỉnh ----
     retrace_info = build_retrace_zones(main_trend, signal, df15, df30, c1h, atr)
 
     # ---- Message ----
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    exness_price = to_exness_price(price)
-    
-    msg = f"""
-    *✅✅✅BTC UPDATE (OKX: {OKX_SYMBOL})*
-    Thời gian: `{now_str}`
-    Giá EXNESS: `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
-    
-    *Trend higher timeframe (cache):*
-    - Trend 30m: `{trend_30m}`       
-    - 1H: `{t1h}` (Close: {c1h['close']:.2f})
-    - 2H: `{t2h}` (Close: {c2h['close']:.2f})
-    - 4H: `{t4h}` (Close: {c4h['close']:.2f})
-    → *Trend chính (ưu tiên 4H):* `{main_trend}`
+    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    session_note = build_session_note(now_utc)
 
-    *Khung 15m (khung trade chính):*
-    - {force}
-    - Tín hiệu: *{signal}*
-    - {recommendation}
-    - ATR14 15m: `{atr_str}`
-      → {classify_atr(atr)}
+    exness_price = to_exness_price(price)
+
+    ms_15m_str = {
+        "UP": "Tăng (HH-HL)",
+        "DOWN": "Giảm (LH-LL)",
+        "RANGE": "Sideway"
+    }.get(ms_15m, ms_15m)
+
+    ms_30m_str = {
+        "UP": "Tăng (HH-HL)",
+        "DOWN": "Giảm (LH-LL)",
+        "RANGE": "Sideway"
+    }.get(ms_30m, ms_30m)
+
+    msg = f"""
+✅✅✅ *BTC UPDATE (OKX: {OKX_SYMBOL})*
+Thời gian: `{now_str}`
+Giá EXNESS (quy đổi): `{exness_price:.2f}` (lệch {EXNESS_PRICE_OFFSET:+.2f})
+
+*Trend higher timeframe (cache):*
+- Trend 30m: `{trend_30m}`
+- 1H: `{t1h}` (Close: {c1h['close']:.2f})
+- 2H: `{t2h}` (Close: {c2h['close']:.2f})
+- 4H: `{t4h}` (Close: {c4h['close']:.2f})
+→ *Trend chính (ưu tiên 4H):* `{main_trend}`
+
+*Market structure:*
+- 15m: `{ms_15m_str}`
+- 30m: `{ms_30m_str}`
+
+*Khung 15m (khung trade chính):*
+- {force}
+- Tín hiệu: *{signal}*
+- Khuyến nghị: {recommendation}
+- ATR14 15m: `{atr_str}`
+  → {classify_atr(atr)}
+- RSI14 15m: `{rsi_str}`
+- Chế độ thị trường: `{regime}`
+- Độ sâu nhịp hồi/điều chỉnh: {pullback_comment}
+
+- {session_note}
+"""
 
     if retrace_info:
         if retrace_info["direction"] == "UP":
             msg += "\n*Khả năng hồi lên các vùng (EXNESS):*"
         else:
             msg += "\n*Khả năng điều chỉnh về các vùng (EXNESS):*"
-    
+
         for label, (z_low, z_high) in retrace_info["zones"]:
             ex_low = to_exness_price(z_low)
             ex_high = to_exness_price(z_high)
-            msg += f"\n• {label}: {ex_low:.2f} – {ex_high:.2f}"
-    
-        msg += f"""
-    """
+            msg += f"\n• {label}: `{ex_low:.2f} – {ex_high:.2f}`"
+
+        msg += "\n"
+
     if trade:
         ex_entry = to_exness_price(trade["entry"])
         ex_tp = to_exness_price(trade["tp"])
         ex_sl = to_exness_price(trade["sl"])
+
         msg += f"""
-    *🎯 Gợi ý lệnh (ATR-based 15m):*
-    - Lệnh: **{trade['side']}**    
-        - Entry: `{ex_entry}`
-        - TP: `{ex_tp}`
-        - SL: `{ex_sl}`
-    """
+*🎯 Gợi ý lệnh (ATR-based 15m):*
+- Lệnh: **{trade['side']}**
+
+- Entry (OKX): `{trade['entry']}`
+- TP (OKX): `{trade['tp']}`
+- SL (OKX): `{trade['sl']}`
+
+- Entry dự kiến trên EXNESS: `{ex_entry}`
+- TP dự kiến trên EXNESS: `{ex_tp}`
+- SL dự kiến trên EXNESS: `{ex_sl}`
+(ATR14 15m ≈ `{trade['atr']}`)
+"""
 
     # ---- Signature chống spam ----
     trade_side = trade["side"] if trade else "NONE"
-    price_band = int(price // 200)  # mỗi ~200$ gửi lại 1 lần dù trạng thái giống
+    price_band = int(price // 300)  # mỗi ~300$ gửi lại 1 lần dù trạng thái giống
 
     signature = "|".join([
         main_trend,
@@ -637,6 +841,8 @@ def analyze_and_build_message():
         t4h,
         trend_30m,
         trade_side,
+        regime,
+        ms_15m,
         str(price_band),
     ])
 
