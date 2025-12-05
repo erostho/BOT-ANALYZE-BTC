@@ -9,7 +9,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 
 # =========================
-# CONFIG TỪ BIẾN MÔI TRƯỜNG
+# CONFIG
 # =========================
 
 OKX_BASE = "https://www.okx.com"
@@ -22,25 +22,23 @@ GOOGLE_SHEET_WORKSHEET = os.environ.get("GOOGLE_SHEET_WORKSHEET", "CANDLES")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Map timeframe nội bộ -> OKX "bar"
 TIMEFRAMES = {
-    "5m": "5m",
     "15m": "15m",
     "30m": "30m",
     "1H": "1H",
     "2H": "2H",
     "4H": "4H",
-    "1D": "1D",
 }
 
 
 # =========================
-# GOOGLE SHEET (CANDLES CACHE)
+# GOOGLE SHEETS
 # =========================
 
 def _get_gsheet_client():
     if not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
         raise RuntimeError("Missing GOOGLE_SA_JSON or GOOGLE_SHEET_ID in env")
+
     sa_info = json.loads(GOOGLE_SA_JSON)
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -57,7 +55,7 @@ def get_cache_sheet():
     try:
         ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=GOOGLE_SHEET_WORKSHEET, rows=2000, cols=10)
+        ws = sh.add_worksheet(title=GOOGLE_SHEET_WORKSHEET, rows=50, cols=10)
         ws.append_row([
             "timeframe", "close_time",
             "open", "high", "low", "close", "volume",
@@ -67,37 +65,38 @@ def get_cache_sheet():
 
 
 def get_state_sheet():
-    """Sheet riêng lưu trạng thái lần chạy trước để chống spam Telegram."""
     client = _get_gsheet_client()
     sh = client.open_by_key(GOOGLE_SHEET_ID)
-    sheet_name = "STATE"
+    name = "STATE"
     try:
-        ws = sh.worksheet(sheet_name)
+        ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=sheet_name, rows=10, cols=3)
+        ws = sh.add_worksheet(title=name, rows=10, cols=3)
         ws.append_row(["key", "signature"])
     return ws
 
 
-def read_cache_row(ws, tf, close_time_str):
+def read_cache_row(ws, tf):
+    """Lấy 1 dòng theo timeframe (mỗi TF chỉ 1 dòng)."""
     rows = ws.get_all_records()
     for row in rows:
-        if str(row.get("timeframe")) == tf and str(row.get("close_time")) == close_time_str:
+        if str(row.get("timeframe")) == tf:
             return row
     return None
 
 
 def upsert_cache_row(ws, tf, close_time_str, o, h, l, c, v):
     """
-    Nếu đã có dòng (timeframe, close_time) -> UPDATE
-    Nếu chưa có -> APPEND
+    Mỗi timeframe chỉ 1 dòng:
+      - Nếu đã có TF -> update đè
+      - Nếu chưa có -> append
     """
     rows = ws.get_all_records()
-    target_row_index = None  # index thực trên sheet, bắt đầu từ 2
+    target_idx = None
 
-    for i, row in enumerate(rows, start=2):
-        if str(row.get("timeframe")) == tf and str(row.get("close_time")) == close_time_str:
-            target_row_index = i
+    for i, row in enumerate(rows, start=2):  # get_all_records bắt đầu từ row 2
+        if str(row.get("timeframe")) == tf:
+            target_idx = i
             break
 
     values = [
@@ -107,23 +106,18 @@ def upsert_cache_row(ws, tf, close_time_str, o, h, l, c, v):
         datetime.utcnow().isoformat(),
     ]
 
-    if target_row_index:
-        ws.update(f"A{target_row_index}:H{target_row_index}", [values])
+    if target_idx:
+        ws.update(f"A{target_idx}:H{target_idx}", [values])
     else:
         ws.append_row(values)
 
 
-# =========================
-# STATE (CHỐNG SPAM)
-# =========================
-
 def get_last_signature():
     ws = get_state_sheet()
     rows = ws.get_all_records()
-    for row_index, row in enumerate(rows, start=2):
+    for i, row in enumerate(rows, start=2):
         if row.get("key") == "last":
-            return row.get("signature"), ws, row_index
-    # chưa có
+            return row.get("signature"), ws, i
     return None, ws, None
 
 
@@ -195,7 +189,7 @@ def get_lower_tf_df(tf: str, limit=200) -> pd.DataFrame:
 
 
 # =========================
-# HIGH TF CACHE
+# HIGH TF CACHE (1H,2H,4H)
 # =========================
 
 def compute_latest_close_time(tf: str, now_utc: datetime) -> datetime:
@@ -213,10 +207,6 @@ def compute_latest_close_time(tf: str, now_utc: datetime) -> datetime:
         base = now_utc.replace(hour=h, minute=0, second=0, microsecond=0)
         return base if now_utc >= base else base - timedelta(hours=4)
 
-    if tf == "1D":
-        base = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        return base if now_utc >= base else base - timedelta(days=1)
-
     raise ValueError("Unsupported TF in compute_latest_close_time")
 
 
@@ -225,8 +215,8 @@ def get_higher_tf_candle(tf: str, ws) -> dict:
     close_time = compute_latest_close_time(tf, now_utc)
     close_time_str = close_time.isoformat()
 
-    cached = read_cache_row(ws, tf, close_time_str)
-    if cached:
+    cached = read_cache_row(ws, tf)
+    if cached and str(cached.get("close_time")) == close_time_str:
         return {
             "close_time": close_time,
             "open": float(cached["open"]),
@@ -259,12 +249,14 @@ def get_higher_tf_candle(tf: str, ws) -> dict:
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram env missing, message below:")
+        print("Telegram ENV missing, message below:")
         print(text)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID,
+               "text": text,
+               "parse_mode": "Markdown"}
 
     try:
         requests.post(url, json=payload, timeout=10)
@@ -274,7 +266,7 @@ def send_telegram(text: str):
 
 
 # =========================
-# TREND & TRADE LOGIC
+# TREND & SIGNAL LOGIC
 # =========================
 
 def detect_simple_trend_from_candle(candle: dict) -> str:
@@ -295,28 +287,36 @@ def detect_tf_trend(df: pd.DataFrame) -> str:
 
 
 def build_trade_suggestion(signal: str, last: pd.Series):
-    atr = last.get("atr14", None)
+    atr = last.get("atr14")
     if atr is None or pd.isna(atr):
         return None
 
     price = last["close"]
     ema20 = last["ema20"]
 
-    SL_ATR = 1.0
-    TP_RR = 2.0
-
     if "LONG" in signal:
-        entry = ema20 if "Gần" in signal else price
-        sl = entry - SL_ATR * atr
-        tp = entry + SL_ATR * TP_RR * atr
         side = "LONG"
     elif "SHORT" in signal:
-        entry = ema20 if "Gần" in signal else price
-        sl = entry + SL_ATR * atr
-        tp = entry - SL_ATR * TP_RR * atr
         side = "SHORT"
     else:
         return None
+
+    # Trend trade vs hồi kỹ thuật
+    if "hồi kỹ thuật" in signal:
+        SL_ATR = 0.7
+        TP_RR = 1.2
+    else:
+        SL_ATR = 1.0
+        TP_RR = 2.0
+
+    entry = price  # có thể thay bằng ema20 nếu bạn thích
+
+    if side == "LONG":
+        sl = entry - SL_ATR * atr
+        tp = entry + SL_ATR * TP_RR * atr
+    else:  # SHORT
+        sl = entry + SL_ATR * atr
+        tp = entry - SL_ATR * TP_RR * atr
 
     return {
         "side": side,
@@ -327,6 +327,30 @@ def build_trade_suggestion(signal: str, last: pd.Series):
     }
 
 
+def build_recommendation(signal: str, trend: str) -> str:
+    if signal == "SHORT mạnh":
+        return "Khuyến nghị: SHORT mạnh theo xu hướng. TP xa, có thể giữ lệnh."
+    if signal == "LONG mạnh":
+        return "Khuyến nghị: LONG mạnh theo xu hướng. TP xa, có thể giữ lệnh."
+
+    if signal == "LONG hồi kỹ thuật":
+        return "Khuyến nghị: LONG nhẹ (scalp). TP gần. Không giữ lâu vì ngược xu hướng."
+    if signal == "SHORT hồi kỹ thuật":
+        return "Khuyến nghị: SHORT nhẹ (scalp). TP gần. Không giữ lâu vì ngược xu hướng."
+
+    if signal == "Chờ SHORT lại":
+        return "Khuyến nghị: Nhịp hồi kỹ thuật trong Downtrend – chờ giá lên vùng cản rồi SHORT lại."
+    if signal == "Chờ LONG lại":
+        return "Khuyến nghị: Nhịp điều chỉnh trong Uptrend – chờ giá điều chỉnh xong rồi LONG lại."
+
+    # fallback
+    if trend == "DOWN":
+        return "Khuyến nghị: Ưu tiên tìm điểm SHORT, hạn chế LONG dài."
+    if trend == "UP":
+        return "Khuyến nghị: Ưu tiên tìm điểm LONG, hạn chế SHORT dài."
+    return "Khuyến nghị: Thị trường sideway, ưu tiên đứng ngoài."
+
+
 # =========================
 # MAIN ANALYSIS
 # =========================
@@ -334,96 +358,58 @@ def build_trade_suggestion(signal: str, last: pd.Series):
 def analyze_and_build_message():
     ws = get_cache_sheet()
 
-    # --- Higher TF ---
+    # ---- Trend higher timeframe (1H,2H,4H) ----
     c1h = get_higher_tf_candle("1H", ws)
     c2h = get_higher_tf_candle("2H", ws)
     c4h = get_higher_tf_candle("4H", ws)
-    c1d = get_higher_tf_candle("1D", ws)
 
     t1h = detect_simple_trend_from_candle(c1h)
     t2h = detect_simple_trend_from_candle(c2h)
     t4h = detect_simple_trend_from_candle(c4h)
-    t1d = detect_simple_trend_from_candle(c1d)
 
-    main_trend = t1d
-    if main_trend == "SIDEWAY":
-        main_trend = t4h
+    main_trend = t4h
     if main_trend == "SIDEWAY":
         main_trend = t2h
     if main_trend == "SIDEWAY":
         main_trend = t1h
 
-    # --- M5 ---
-    df5 = get_lower_tf_df("5m", 200)
-    df5["ema20"] = df5["close"].ewm(span=20).mean()
-    df5["ema50"] = df5["close"].ewm(span=50).mean()
-    df5["vol_ma20"] = df5["volume"].rolling(20).mean()
-
-    df5["prev_close"] = df5["close"].shift(1)
-    df5["tr1"] = df5["high"] - df5["low"]
-    df5["tr2"] = (df5["high"] - df5["prev_close"]).abs()
-    df5["tr3"] = (df5["low"] - df5["prev_close"]).abs()
-    df5["tr"] = df5[["tr1", "tr2", "tr3"]].max(axis=1)
-    df5["atr14"] = df5["tr"].rolling(14).mean()
-
-    last5 = df5.iloc[-1]
-    prev5 = df5.iloc[-2]
-
-    price = last5["close"]
-    body = abs(last5["close"] - last5["open"])
-    body_prev = abs(prev5["close"] - prev5["open"])
-    vol = last5["volume"]
-    vol_ma20 = last5["vol_ma20"] if not pd.isna(last5["vol_ma20"]) else 0
-
-    is_bull = last5["close"] > last5["open"]
-    is_bear = last5["close"] < last5["open"]
-    vol_strong = vol_ma20 > 0 and vol > 1.5 * vol_ma20 and body > body_prev
-
-    force = "Trung lập"
-    base_signal = "Không rõ"
-
-    if main_trend == "UP":
-        if is_bull and last5["close"] > last5["ema20"]:
-            force = "Lực mua chiếm ưu thế"
-            base_signal = "LONG mạnh" if vol_strong else "Gần LONG"
-        elif is_bear:
-            force = "Nhịp điều chỉnh trong Uptrend"
-            base_signal = "Chờ LONG lại"
-
-    elif main_trend == "DOWN":
-        if is_bear and last5["close"] < last5["ema20"]:
-            force = "Lực bán chiếm ưu thế"
-            base_signal = "SHORT mạnh" if vol_strong else "Gần SHORT"
-        elif is_bull:
-            force = "Nhịp hồi kỹ thuật trong Downtrend"
-            base_signal = "Chờ SHORT lại"
-    else:
-        force = "Sideway"
-        base_signal = "Sideway – ưu tiên đứng ngoài"
-
-    # --- M15 & M30 ---
+    # ---- TF trade chính: 15m ----
     df15 = get_lower_tf_df("15m", 200)
     df15["ema20"] = df15["close"].ewm(span=20).mean()
     df15["ema50"] = df15["close"].ewm(span=50).mean()
-    trend_m15 = detect_tf_trend(df15)
+    df15["vol_ma20"] = df15["volume"].rolling(20).mean()
 
-    df30 = get_lower_tf_df("30m", 200)
-    df30["ema20"] = df30["close"].ewm(span=20).mean()
-    df30["ema50"] = df30["close"].ewm(span=50).mean()
-    trend_m30 = detect_tf_trend(df30)
+    df15["prev_close"] = df15["close"].shift(1)
+    df15["tr1"] = df15["high"] - df15["low"]
+    df15["tr2"] = (df15["high"] - df15["prev_close"]).abs()
+    df15["tr3"] = (df15["low"] - df15["prev_close"]).abs()
+    df15["tr"] = df15[["tr1", "tr2", "tr3"]].max(axis=1)
+    df15["atr14"] = df15["tr"].rolling(14).mean()
 
-    # lưu nến cuối cùng M15/M30 vào cache (tuỳ bạn có dùng xem log hay không)
-    last15 = df15.iloc[-1]
+    last = df15.iloc[-1]
+    prev1 = df15.iloc[-2]
+    prev2 = df15.iloc[-3]
+
+    price = last["close"]
+    atr = last["atr14"]
+
+    # lưu nến 15m cuối vào cache để theo dõi
     upsert_cache_row(
         ws,
         "15m",
-        last15["time"].isoformat(),
-        last15["open"],
-        last15["high"],
-        last15["low"],
-        last15["close"],
-        last15["volume"],
+        last["time"].isoformat(),
+        last["open"],
+        last["high"],
+        last["low"],
+        last["close"],
+        last["volume"],
     )
+
+    # ---- 30m để tham khảo xu hướng gần hơn ----
+    df30 = get_lower_tf_df("30m", 200)
+    df30["ema20"] = df30["close"].ewm(span=20).mean()
+    df30["ema50"] = df30["close"].ewm(span=50).mean()
+    trend_30m = detect_tf_trend(df30)
 
     last30 = df30.iloc[-1]
     upsert_cache_row(
@@ -437,90 +423,114 @@ def analyze_and_build_message():
         last30["volume"],
     )
 
-    # --- Lọc tín hiệu bằng M15/M30 ---
-    filtered_signal = base_signal
+    # ---- Xác định tín hiệu trên 15m ----
+    def is_bull(row):
+        return row["close"] > row["open"]
 
-    if "LONG" in base_signal:
-        if trend_m30 == "DOWN":
-            filtered_signal = "BỎ QUA – M30 DOWN ngược xu hướng LONG"
+    def is_bear(row):
+        return row["close"] < row["open"]
+
+    three_bull = (
+        is_bull(last) and is_bull(prev1) and is_bull(prev2)
+        and last["close"] > prev1["close"] > prev2["close"]
+    )
+    three_bear = (
+        is_bear(last) and is_bear(prev1) and is_bear(prev2)
+        and last["close"] < prev1["close"] < prev2["close"]
+    )
+
+    true_range = last["tr"]
+    big_move = (not pd.isna(atr)) and (true_range > 1.0 * atr)
+    moderate_move = (not pd.isna(atr)) and (true_range > 0.8 * atr)
+
+    vol = last["volume"]
+    vol_ma20 = last["vol_ma20"] if not pd.isna(last["vol_ma20"]) else 0.0
+    vol_ok = (vol_ma20 == 0) or (vol > 1.1 * vol_ma20)
+
+    force = "Trung lập"
+    signal = "Không rõ"
+
+    # DOWN trend logic
+    if main_trend == "DOWN":
+        if is_bear(last) and last["close"] < last["ema20"] < last["ema50"] and big_move and vol_ok:
+            force = "Lực bán chiếm ưu thế trong Downtrend"
+            signal = "SHORT mạnh"
+        elif three_bull and last["close"] > last["ema20"] and moderate_move:
+            force = "Nhịp hồi kỹ thuật trong Downtrend"
+            signal = "LONG hồi kỹ thuật"
         else:
-            if trend_m15 == "DOWN":
-                filtered_signal += " ⚠️ (M15 DOWN ngược hướng)"
-            elif trend_m15 == "SIDEWAY":
-                filtered_signal += " ⚠️ (M15 SIDEWAY – tín hiệu yếu)"
+            force = "Nhịp hồi kỹ thuật trong Downtrend"
+            signal = "Chờ SHORT lại"
 
-    elif "SHORT" in base_signal:
-        if trend_m30 == "UP":
-            filtered_signal = "BỎ QUA – M30 UP ngược xu hướng SHORT"
+    # UP trend logic
+    elif main_trend == "UP":
+        if is_bull(last) and last["close"] > last["ema20"] > last["ema50"] and big_move and vol_ok:
+            force = "Lực mua chiếm ưu thế trong Uptrend"
+            signal = "LONG mạnh"
+        elif three_bear and last["close"] < last["ema20"] and moderate_move:
+            force = "Nhịp điều chỉnh giảm trong Uptrend"
+            signal = "SHORT hồi kỹ thuật"
         else:
-            if trend_m15 == "UP":
-                filtered_signal += " ⚠️ (M15 UP ngược hướng)"
-            elif trend_m15 == "SIDEWAY":
-                filtered_signal += " ⚠️ (M15 SIDEWAY – tín hiệu yếu)"
+            force = "Nhịp điều chỉnh giảm trong Uptrend"
+            signal = "Chờ LONG lại"
 
-    # --- Gợi ý lệnh ---
-    if filtered_signal.startswith("BỎ QUA"):
-        trade = None
-        recommendation = "Khuyến cáo: M30 đi ngược tín hiệu M5, ưu tiên đứng ngoài."
     else:
-        trade = build_trade_suggestion(base_signal, last5)
+        force = "Thị trường sideway"
+        signal = "Sideway – ưu tiên đứng ngoài"
 
-        if "LONG mạnh" in base_signal and main_trend == "UP":
-            recommendation = "Khuyến cáo: Có thể vào LONG theo trend, quản lý vốn chặt."
-        elif "SHORT mạnh" in base_signal and main_trend == "DOWN":
-            recommendation = "Khuyến cáo: Có thể vào SHORT theo trend, quản lý vốn chặt."
-        elif "Gần LONG" in base_signal or "Gần SHORT" in base_signal:
-            recommendation = "Khuyến cáo: Tín hiệu đang hình thành, có thể vào lệnh nhỏ hoặc chờ thêm 1–2 nến xác nhận."
-        elif "Sideway" in base_signal:
-            recommendation = "Khuyến cáo: Thị trường sideway, ưu tiên NO TRADE."
-        else:
-            recommendation = "Khuyến cáo: Quan sát thêm, chưa phải điểm vào lệnh đẹp."
+    # ---- Gợi ý lệnh & khuyến nghị ----
+    recommendation = build_recommendation(signal, main_trend)
+    trade = None
+    if "LONG" in signal or "SHORT" in signal:
+        trade = build_trade_suggestion(signal, last)
 
-    # --- Build message + signature ---
+    # ---- Message ----
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     msg = f"""
-*✅✅✅BTC UPDATE (OKX: {OKX_SYMBOL})*
+*BTC UPDATE (OKX: {OKX_SYMBOL})*
 Thời gian: `{now_str}`
-Giá hiện tại (M5): `{price:.2f}`
+Giá hiện tại (15m): `{price:.2f}`
 
-*Trend higher timeframe:*
+*Trend higher timeframe (cache):*
 - 1H: `{t1h}` (Close: {c1h['close']:.2f})
 - 2H: `{t2h}` (Close: {c2h['close']:.2f})
 - 4H: `{t4h}` (Close: {c4h['close']:.2f})
-- 1D: `{t1d}` (Close: {c1d['close']:.2f})
-→ *Trend chính:* `{main_trend}`
+→ *Trend chính (ưu tiên 4H):* `{main_trend}`
 
-*Khung M5:*
+*Khung 15m (khung trade chính):*
 - {force}
-- Tín hiệu gốc (M5): *{base_signal}*
-- ATR14 M5: `{last5['atr14']:.2f}`
+- Tín hiệu: *{signal}*
+- Khuyến nghị: {recommendation}
+- ATR14 15m: `{atr:.2f if not pd.isna(atr) else 'N/A'}`
 
-*Khung xác nhận:*
-- M15 trend: `{trend_m15}` - M30 trend: `{trend_m30}`
-
-*Tín hiệu sau khi lọc:* {filtered_signal}
-{recommendation}
+*Khung 30m (tham khảo):*
+- Trend 30m: `{trend_30m}`
 """
+
     if trade:
         msg += f"""
-*🎯 Gợi ý lệnh (ATR-based M5):*
+*🎯 Gợi ý lệnh (ATR-based 15m):*
 - Lệnh: **{trade['side']}**
 - Entry: `{trade['entry']}`
 - TP: `{trade['tp']}`
 - SL: `{trade['sl']}`
-(ATR14 M5 ≈ `{trade['atr']}`)
+(ATR14 15m ≈ `{trade['atr']}`)
 """
 
-    # Signature: chỉ dùng các thông tin rời rạc, không dùng timestamp
+    # ---- Signature chống spam ----
     trade_side = trade["side"] if trade else "NONE"
+    price_band = int(price // 200)  # mỗi ~200$ gửi lại 1 lần dù trạng thái giống
+
     signature = "|".join([
         main_trend,
-        base_signal,
-        filtered_signal,
-        trend_m15,
-        trend_m30,
+        signal,
+        t1h,
+        t2h,
+        t4h,
+        trend_30m,
         trade_side,
+        str(price_band),
     ])
 
     return msg, signature
@@ -532,16 +542,16 @@ Giá hiện tại (M5): `{price:.2f}`
 
 def main():
     try:
-        msg, signature = analyze_and_build_message()
+        msg, sig = analyze_and_build_message()
+        last_sig, state_ws, row_idx = get_last_signature()
 
-        last_sig, state_ws, row_index = get_last_signature()
-        if last_sig == signature:
+        if last_sig == sig:
             print("No state change – skip Telegram.")
             return
 
         send_telegram(msg)
-        update_last_signature(state_ws, row_index, signature)
-        print("Sent Telegram. New signature:", signature)
+        update_last_signature(state_ws, row_idx, sig)
+        print("Sent Telegram. New signature:", sig)
 
     except Exception as e:
         print("Error in main():", repr(e))
