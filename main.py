@@ -1002,6 +1002,8 @@ def analyze_and_build_message() -> (str, str):
     msg_lines: List[str] = []
     msg_lines.append("✅✅✅ *UPDATE INFO (BTC-USDT)*")
     msg_lines.append(f"Tín hiệu: {signal}")
+    if score_comment:
+        msg_lines.append(f"- {score_comment}")
     msg_lines.append(f"Thời gian: `{now_str}`")
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
@@ -1024,8 +1026,6 @@ def analyze_and_build_message() -> (str, str):
     msg_lines.append(f"  → {atr_text}")
     if not math.isnan(rsi_15):
         msg_lines.append(f"- RSI14 15m: {rsi_15:.1f} – Chế độ thị trường: {regime}")
-    if score_comment:
-        msg_lines.append(f"- {score_comment}")
     if news_like:
         msg_lines.append("⚠ Có nến biến động >3×ATR (giống nến tin tức) trong 1–2 nến gần đây – nên cẩn trọng với tín hiệu.")
     msg_lines.append("")
