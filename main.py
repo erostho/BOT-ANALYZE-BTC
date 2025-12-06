@@ -632,8 +632,8 @@ def analyze_and_build_message() -> (str, str):
     now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
     msg_lines: List[str] = []
-    msg_lines.append("✅✅✅ *BTC UPDATE INFO (BTC-USDT)*")
-    msg_lines.append(f"- *Tín hiệu:* {signal}")
+    msg_lines.append("✅✅✅ *UPDATE INFO (BTC-USDT)*")
+    msg_lines.append(f"Tín hiệu: {signal}")
     msg_lines.append(f"Thời gian: `{now_str}`")
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
@@ -684,7 +684,7 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append(f"- TP EXNESS: {ex_tp:,.1f}")
         msg_lines.append(f"- SL EXNESS: {ex_sl:,.1f}")
     else:
-        msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
+        msg_lines.append("⚠ Hiện tín hiệu chưa đủ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
 
     # === TẠO state_key cho logic chống spam ===
     state_parts = [
