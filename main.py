@@ -588,6 +588,7 @@ def analyze_and_build_message() -> str:
 
     msg_lines: List[str] = []
     msg_lines.append("✅✅✅ *BTC UPDATE INFO (BTC-USDT)*")
+    msg_lines.append(f"- *Tín hiệu:* {signal}")
     msg_lines.append(f"Thời gian: `{now_str}`")
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
@@ -605,7 +606,6 @@ def analyze_and_build_message() -> str:
     msg_lines.append("*Khung 15m (khung trade chính):*")
     msg_lines.append(f"- Xu hướng EMA 15m: {trend_15}")
     msg_lines.append(f"- {force}")
-    msg_lines.append(f"- *Tín hiệu:* {signal}")
     msg_lines.append(f"- ATR14 15m: {atr_15:.2f}")
     msg_lines.append(f"  → {atr_text}")
     if not math.isnan(rsi_15):
