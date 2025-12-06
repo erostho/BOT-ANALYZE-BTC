@@ -684,7 +684,7 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append(f"- TP EXNESS: {ex_tp:,.1f}")
         msg_lines.append(f"- SL EXNESS: {ex_sl:,.1f}")
     else:
-        msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh cụ thể (NO TRADE hoặc tránh vào trễ).")
+        msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
 
     # === TẠO state_key cho logic chống spam ===
     state_parts = [
