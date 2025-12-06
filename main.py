@@ -150,7 +150,12 @@ def detect_trend_from_ema(last_row: pd.Series) -> str:
     return "SIDE"
 
 
-def _detect_swings(df: pd.DataFrame, lookback: int = 60, left: int = 2, right: int = 2) -> Tuple[List[Tuple[pd.Timestamp, float]], List[Tuple[pd.Timestamp, float]]]:
+def _detect_swings(
+    df: pd.DataFrame,
+    lookback: int = 60,
+    left: int = 2,
+    right: int = 2,
+) -> Tuple[List[Tuple[pd.Timestamp, float]], List[Tuple[pd.Timestamp, float]]]:
     """
     Tìm swing high / swing low dạng fractal:
     - swing high: high[i] > high[i-k] & high[i] > high[i+k] (k=1..left/right)
@@ -278,6 +283,19 @@ def get_session_note(now_utc: datetime) -> str:
     return f"Giờ VN {vn_time.strftime('%H:%M')} – phiên Mỹ, thị trường thường sôi động mạnh."
 
 
+def get_session_type(now_utc: datetime) -> str:
+    """
+    Trả về: 'ASIA' / 'EU' / 'US'
+    """
+    vn_time = now_utc.astimezone(VN_TZ)
+    hour = vn_time.hour
+    if 7 <= hour < 14:
+        return "ASIA"
+    if 14 <= hour < 20:
+        return "EU"
+    return "US"
+
+
 def get_retrace_zones(direction: str, last_close: float, atr: float) -> Dict[str, Any]:
     """
     Tính vùng hồi / điều chỉnh dựa trên ATR quanh giá hiện tại.
@@ -386,6 +404,108 @@ def send_telegram_message(text: str) -> None:
 
 
 # ========================
+#  Trend Reliability & News filter
+# ========================
+
+def compute_trend_reliability(
+    main_trend: str,
+    trend_15: str,
+    ms_15m: str,
+    ms_30m: str,
+    tf_trends: Dict[str, Dict[str, Any]],
+    last15: pd.Series,
+    atr_15: float,
+    rsi_15: float,
+    vol_15: float,
+    vol_ma20_15: float,
+) -> Tuple[int, str]:
+    """
+    Trend Reliability Index (TRI) 0–100
+    Dựa trên:
+    - Đồng hướng đa khung
+    - EMA20–EMA50 spread
+    - RSI lệch khỏi 50
+    - Volume ủng hộ xu hướng
+    """
+    tri = 0
+
+    if main_trend in ("UP", "DOWN") and trend_15 == main_trend:
+        tri += 15
+
+    if ("Tăng" in ms_15m and main_trend == "UP") or ("Giảm" in ms_15m and main_trend == "DOWN"):
+        tri += 15
+
+    if ("Tăng" in ms_30m and main_trend == "UP") or ("Giảm" in ms_30m and main_trend == "DOWN"):
+        tri += 10
+
+    t1h = tf_trends.get("1H", {}).get("trend")
+    if t1h == main_trend:
+        tri += 10
+
+    if atr_15 > 0:
+        ema_spread = abs(float(last15["ema20"] - last15["ema50"]))
+        if ema_spread >= 0.4 * atr_15:
+            tri += 20
+
+    if not math.isnan(rsi_15):
+        if main_trend == "UP" and rsi_15 >= 55:
+            tri += 15
+        elif main_trend == "DOWN" and rsi_15 <= 45:
+            tri += 15
+
+    if vol_ma20_15 > 0 and vol_15 >= 1.2 * vol_ma20_15:
+        tri += 15
+
+    tri = max(0, min(100, tri))
+
+    if tri < 40:
+        desc = "Trend yếu / dễ nhiễu"
+    elif tri < 60:
+        desc = "Trend trung bình"
+    elif tri < 80:
+        desc = "Trend khá tin cậy"
+    else:
+        desc = "Trend rất mạnh & tin cậy"
+
+    return tri, desc
+
+
+def detect_news_like_bar(
+    df15: pd.DataFrame,
+    atr_15: float,
+    df5: pd.DataFrame,
+    atr_5: float,
+) -> bool:
+    """
+    Nến "giống nến tin" khi biên độ > 3×ATR trên 15m hoặc 5m.
+    """
+    if atr_15 <= 0 and atr_5 <= 0:
+        return False
+
+    # 15m
+    last15 = df15.iloc[-1]
+    prev15 = df15.iloc[-2]
+    tr_last15 = float(last15["high"] - last15["low"])
+    tr_prev15 = float(prev15["high"] - prev15["low"])
+    news_15 = False
+    if atr_15 > 0:
+        if tr_last15 > 3 * atr_15 or tr_prev15 > 3 * atr_15:
+            news_15 = True
+
+    # 5m
+    last5 = df5.iloc[-1]
+    prev5 = df5.iloc[-2]
+    tr_last5 = float(last5["high"] - last5["low"])
+    tr_prev5 = float(prev5["high"] - prev5["low"])
+    news_5 = False
+    if atr_5 > 0:
+        if tr_last5 > 3 * atr_5 or tr_prev5 > 3 * atr_5:
+            news_5 = True
+
+    return news_15 or news_5
+
+
+# ========================
 #  Signal quality scoring
 # ========================
 
@@ -401,19 +521,28 @@ def compute_signal_score(
     prev2: pd.Series,
     vol_ma20_15: float,
     trade_signal: Optional[str],
+    is_ma5_up: bool,
+    is_ma5_down: bool,
+    tri_score: int,
+    session_type: str,
+    news_like: bool,
 ) -> Tuple[int, int, int, int]:
     """
     Chấm điểm chất lượng tín hiệu:
     - Trend score  (0–40)
     - Momentum     (0–30)
     - Location     (0–30)
+    + điều chỉnh bởi:
+      - TRI (trend reliability)
+      - phiên (ASIA/EU/US)
+      - news-like bar
     Tổng: 0–100
     """
     trend_score = 0
     momentum_score = 0
     location_score = 0
 
-    # --- Trend score ---
+    # --- Trend score cơ bản ---
     if main_trend in ("UP", "DOWN") and trend_15 == main_trend:
         trend_score += 15
 
@@ -449,6 +578,12 @@ def compute_signal_score(
     elif broke_high or broke_low:
         momentum_score += 5  # có phá range nhưng không khớp hẳn hướng trade
 
+    # Momentum từ MA5
+    if trade_signal in ("LONG mạnh", "LONG hồi kỹ thuật") and is_ma5_up:
+        momentum_score += 5
+    if trade_signal in ("SHORT mạnh", "SHORT hồi kỹ thuật") and is_ma5_down:
+        momentum_score += 5
+
     # --- Location score ---
     if atr_15 > 0:
         dist_ema20 = abs(float(last15["close"] - last15["ema20"]))
@@ -463,6 +598,23 @@ def compute_signal_score(
         location_score += 10
 
     total = trend_score + momentum_score + location_score
+
+    # --- Điều chỉnh theo Trend Reliability Index ---
+    if tri_score >= 60:
+        total += 10
+    elif tri_score < 40:
+        total -= 10
+
+    # --- Điều chỉnh theo phiên giao dịch ---
+    if session_type == "ASIA" and trade_signal in ("LONG mạnh", "SHORT mạnh"):
+        # phiên Á trend thường yếu hơn
+        total -= 10
+
+    # --- Điều chỉnh theo nến "giống tin tức" ---
+    if news_like:
+        total -= 15
+
+    total = max(0, min(100, total))
     return trend_score, momentum_score, location_score, total
 
 
@@ -472,6 +624,7 @@ def compute_signal_score(
 
 def analyze_and_build_message() -> (str, str):
     now_utc = datetime.now(timezone.utc)
+    session_type = get_session_type(now_utc)
 
     # 1) Lấy nến 15m (khung trade chính)
     df15 = fetch_okx_candles(TIMEFRAMES["15m"], limit=200)
@@ -480,6 +633,9 @@ def analyze_and_build_message() -> (str, str):
     df15["atr14"] = calc_atr(df15, 14)
     df15["rsi14"] = rsi(df15["close"], 14)
     df15["vol_ma20"] = df15["volume"].rolling(window=20).mean()
+    # Momentum layer: MA5
+    df15["ma5"] = ema(df15["close"], 5)
+    df15["ma5_slope"] = df15["ma5"].diff()
 
     last15 = df15.iloc[-1]
     prev1 = df15.iloc[-2]
@@ -492,13 +648,18 @@ def analyze_and_build_message() -> (str, str):
     regime = detect_regime(rsi_15, atr_15)
     trend_15 = detect_trend_from_ema(last15)
 
+    ma5_val = float(last15["ma5"]) if not math.isnan(last15["ma5"]) else float("nan")
+    ma5_slope = float(last15["ma5_slope"]) if not math.isnan(last15["ma5_slope"]) else 0.0
+    is_ma5_up = (ma5_slope > 0) and (not math.isnan(ma5_val)) and (last15["close"] > ma5_val)
+    is_ma5_down = (ma5_slope < 0) and (not math.isnan(ma5_val)) and (last15["close"] < ma5_val)
+
     # Độ tuổi nến 15m (để tránh vào lệnh hồi quá trễ)
     last15_ts = df15.index[-1]
     frame_seconds_15 = 15 * 60
     age_seconds_15 = max(0.0, (now_utc - last15_ts).total_seconds())
     bar_age_ratio_15 = min(1.0, age_seconds_15 / frame_seconds_15)
 
-    # 1b) Lấy thêm khung 5m để phát hiện hồi kỹ thuật SỚM
+    # 1b) Lấy thêm khung 5m để phát hiện hồi kỹ thuật SỚM + news-like
     df5 = fetch_okx_candles(TIMEFRAMES["5m"], limit=200)
     df5["rsi14"] = rsi(df5["close"], 14)
     df5["atr14"] = calc_atr(df5, 14)
@@ -536,6 +697,20 @@ def analyze_and_build_message() -> (str, str):
     ms_15m_is_up = "Tăng" in ms_15m
     ms_30m_is_down = "Giảm" in ms_30m
     ms_30m_is_up = "Tăng" in ms_30m
+
+    # BOS: phá swing high/low 15m
+    swing_highs_15, swing_lows_15 = _detect_swings(df15, lookback=80)
+    bos_up = False
+    bos_down = False
+    close_15 = float(last15["close"])
+    if swing_highs_15:
+        last_sh_price = swing_highs_15[-1][1]
+        if close_15 > last_sh_price * 1.001:  # phá swing high rõ ràng
+            bos_up = True
+    if swing_lows_15:
+        last_sl_price = swing_lows_15[-1][1]
+        if close_15 < last_sl_price * 0.999:  # phá swing low rõ ràng
+            bos_down = True
 
     # 4) Exness alignment
     okx_last_price = float(last15["close"])
@@ -575,6 +750,23 @@ def analyze_and_build_message() -> (str, str):
     bull_count_5 = sum(1 for r in last3_5 if is_bull(r))
     bear_count_5 = sum(1 for r in last3_5 if is_bear(r))
     change_5 = float(last5["close"] - prev5_2["close"])
+
+    # News-like bar
+    news_like = detect_news_like_bar(df15, atr_15, df5, atr_5)
+
+    # Trend Reliability Index
+    tri_score, tri_desc = compute_trend_reliability(
+        main_trend=main_trend,
+        trend_15=trend_15,
+        ms_15m=ms_15m,
+        ms_30m=ms_30m,
+        tf_trends=tf_trends,
+        last15=last15,
+        atr_15=atr_15,
+        rsi_15=rsi_15,
+        vol_15=vol_15,
+        vol_ma20_15=vol_ma20_15,
+    )
 
     # =========
     #  Logic tín hiệu: LONG/SHORT MẠNH & HỒI KỸ THUẬT (có early 5m)
@@ -723,6 +915,14 @@ def analyze_and_build_message() -> (str, str):
         force = "Thị trường sideway, không có xu hướng rõ trên khung lớn"
         signal = "Không rõ"
 
+    # BOS override: nếu vừa phá cấu trúc thì ưu tiên báo đảo chiều, tránh gọi hồi kỹ thuật sai
+    if main_trend == "DOWN" and bos_up:
+        force = "Giá vừa phá swing high quan trọng trên 15m – có dấu hiệu đảo chiều từ Downtrend sang Uptrend, hạn chế coi đây là nhịp hồi kỹ thuật."
+        signal = "Không rõ"
+    elif main_trend == "UP" and bos_down:
+        force = "Giá vừa phá swing low quan trọng trên 15m – có dấu hiệu đảo chiều từ Uptrend sang Downtrend, hạn chế coi đây là nhịp hồi kỹ thuật."
+        signal = "Không rõ"
+
     # 6) Khả năng hồi / điều chỉnh (EXNESS)
     if "LONG" in signal and "hồi" in signal:
         retrace_info = get_retrace_zones("up", exness_last, atr_15)
@@ -750,7 +950,7 @@ def analyze_and_build_message() -> (str, str):
         late_retrace = True
         force += " – Nhịp hồi đã đi được phần lớn cây nến, hạn chế vào lệnh mới (tránh vào trễ)."
 
-    # 7b) Tính Signal Score (trend/momentum/location)
+    # 7b) Tính Signal Score (trend/momentum/location + TRI + phiên + news)
     trend_score = momentum_score = location_score = total_score = 0
     if trade_signal is not None:
         trend_score, momentum_score, location_score, total_score = compute_signal_score(
@@ -765,6 +965,11 @@ def analyze_and_build_message() -> (str, str):
             prev2=prev2,
             vol_ma20_15=vol_ma20_15,
             trade_signal=trade_signal,
+            is_ma5_up=is_ma5_up,
+            is_ma5_down=is_ma5_down,
+            tri_score=tri_score,
+            session_type=session_type,
+            news_like=news_like,
         )
 
     # 7c) Gating: chỉ tạo lệnh khi score >= 60 và không bị late_retrace
@@ -773,18 +978,30 @@ def analyze_and_build_message() -> (str, str):
     if trade_signal is not None and not late_retrace and total_score >= 60:
         trade = build_trade_suggestion(trade_signal, last15, atr_15)
         if total_score < 75:
-            score_comment = f"Điểm chất lượng tín hiệu: {total_score}/100 (Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – *tín hiệu KHÁ*, nên vào size vừa phải."
+            score_comment = (
+                f"Điểm chất lượng tín hiệu: {total_score}/100 "
+                f"(Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – "
+                f"*tín hiệu KHÁ*, nên vào size vừa phải."
+            )
         else:
-            score_comment = f"Điểm chất lượng tín hiệu: {total_score}/100 (Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – *tín hiệu MẠNH*, có thể cân nhắc vào lệnh chuẩn size."
+            score_comment = (
+                f"Điểm chất lượng tín hiệu: {total_score}/100 "
+                f"(Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – "
+                f"*tín hiệu MẠNH*, có thể cân nhắc vào lệnh chuẩn size."
+            )
     elif trade_signal is not None and not late_retrace and total_score < 60:
-        score_comment = f"Điểm chất lượng tín hiệu: {total_score}/100 (Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – *dưới ngưỡng 60*, ưu tiên QUAN SÁT (NO TRADE)."
+        score_comment = (
+            f"Điểm chất lượng tín hiệu: {total_score}/100 "
+            f"(Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – "
+            f"*dưới ngưỡng 60*, ưu tiên QUAN SÁT (NO TRADE)."
+        )
 
     # 8) Build message
     now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
     msg_lines: List[str] = []
     msg_lines.append("✅✅✅ *UPDATE INFO (BTC-USDT)*")
-    msg_lines.append(f"- *Tín hiệu:* {signal}")
+    msg_lines.append(f"Tín hiệu: {signal}")
     msg_lines.append(f"Thời gian: `{now_str}`")
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
@@ -794,6 +1011,7 @@ def analyze_and_build_message() -> (str, str):
     msg_lines.append(f"- 2H: {tf_trends['2H']['trend']} (Close: {tf_trends['2H']['close']:,.2f})")
     msg_lines.append(f"- 4H: {tf_trends['4H']['trend']} (Close: {tf_trends['4H']['close']:,.2f})")
     msg_lines.append(f"→ *Trend chính (ưu tiên 4H)*: {main_trend}")
+    msg_lines.append(f"→ Trend Reliability Index (TRI): {tri_score}/100 – {tri_desc}")
     msg_lines.append("")
     msg_lines.append("*Market structure:*")
     msg_lines.append(f"- 15m: {ms_15m}")
@@ -808,8 +1026,11 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append(f"- RSI14 15m: {rsi_15:.1f} – Chế độ thị trường: {regime}")
     if score_comment:
         msg_lines.append(f"- {score_comment}")
+    if news_like:
+        msg_lines.append("⚠ Có nến biến động >3×ATR (giống nến tin tức) trong 1–2 nến gần đây – nên cẩn trọng với tín hiệu.")
     msg_lines.append("")
     msg_lines.append(f"- {get_session_note(now_utc)}")
+    msg_lines.append(f"- Phiên hiện tại: {session_type}")
     msg_lines.append("")
 
     if retrace_info["zones"]:
@@ -838,9 +1059,9 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append(f"- SL EXNESS: {ex_sl:,.1f}")
     else:
         if "NO TRADE" in score_comment or "quan sát" in score_comment:
-            msg_lines.append("⚠ Dù có tín hiệu, *điểm chất lượng thấp* nên ưu tiên QUAN SÁT, chưa gợi ý lệnh cụ thể.")
+            msg_lines.append("⚠ Dù có tín hiệu, *điểm chất lượng thấp* hoặc bối cảnh nhiễu nên ưu tiên QUAN SÁT, chưa gợi ý lệnh cụ thể.")
         else:
-            msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
+            msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh cụ thể (NO TRADE hoặc tránh vào trễ).")
 
     # === TẠO state_key cho logic chống spam ===
     state_parts = [
@@ -852,10 +1073,12 @@ def analyze_and_build_message() -> (str, str):
         signal,
         regime,
         atr_text,
-        # thêm bucket của score để nếu score đổi nhiều thì mới gửi
+        session_type,
+        int(tri_score / 10),
         int(trend_score / 5),
         int(momentum_score / 5),
         int(location_score / 5),
+        int(news_like),
     ]
 
     if trade:
