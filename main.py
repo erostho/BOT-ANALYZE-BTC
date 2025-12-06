@@ -38,6 +38,15 @@ TIMEFRAMES = {
     "4H": "4H",
 }
 
+# số phút cho mỗi timeframe (dùng cho cache nến đã đóng gần nhất)
+TIMEFRAME_MINUTES = {
+    "15m": 15,
+    "30m": 30,
+    "1H": 60,
+    "2H": 120,
+    "4H": 240,
+}
+
 VN_TZ = tz.gettz("Asia/Ho_Chi_Minh")
 
 
@@ -67,6 +76,107 @@ def get_or_create_worksheet(sh, title: str, rows: int = 100, cols: int = 20):
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
+
+# ========================
+#  CANDLES cache helpers
+# ========================
+
+def get_candles_ws(sh):
+    # Sheet chuyên lưu cache nến higher timeframe
+    return get_or_create_worksheet(sh, "CANDLES", rows=20, cols=10)
+
+
+def get_last_closed_open_time(now_utc: datetime, tf_minutes: int) -> datetime:
+    """
+    Tính thời điểm mở nến *đã đóng gần nhất* cho timeframe tf_minutes.
+    Ví dụ: tf=60, giờ hiện tại 10:05 → last closed open = 09:00.
+    """
+    frame_sec = tf_minutes * 60
+    ts = int(now_utc.timestamp())
+    k = ts // frame_sec
+    last_closed_start = (k - 1) * frame_sec
+    return datetime.fromtimestamp(last_closed_start, tz=timezone.utc)
+
+
+def read_cached_tf_candle(ws, tf_name: str):
+    """
+    Đọc 1 dòng cache trong sheet CANDLES theo timeframe.
+    Format mỗi dòng:
+    A: timeframe (15m/30m/1H/2H/4H)
+    B: open_time (ISO)
+    C: open
+    D: high
+    E: low
+    F: close
+    G: volume
+    H: ema20
+    I: ema50
+    J: last_updated (ISO)
+
+    Trả về (open_time: datetime, row_dict) hoặc None nếu không có.
+    """
+    try:
+        values = ws.get_all_values()
+    except Exception as e:
+        _log(f"read_cached_tf_candle error: {e}")
+        return None
+
+    for i, row in enumerate(values, start=1):
+        if not row or len(row) < 6:
+            continue
+        if row[0] == tf_name:
+            try:
+                open_time = datetime.fromisoformat(row[1])
+                data = {
+                    "open": float(row[2]),
+                    "high": float(row[3]),
+                    "low": float(row[4]),
+                    "close": float(row[5]),
+                    "volume": float(row[6]) if len(row) > 6 and row[6] else float("nan"),
+                    "ema20": float(row[7]) if len(row) > 7 and row[7] else float("nan"),
+                    "ema50": float(row[8]) if len(row) > 8 and row[8] else float("nan"),
+                }
+                return open_time, data
+            except Exception as e:
+                _log(f"parse cached candle row error: {e}")
+                return None
+    return None
+
+
+def upsert_tf_candle(ws, tf_name: str, df: pd.DataFrame) -> None:
+    """
+    Lưu nến đã đóng mới nhất + ema20/ema50 vào sheet CANDLES.
+    Ghi đè nếu đã có timeframe đó.
+    """
+    last = df.iloc[-1]
+    open_time = df.index[-1]
+    open_str = open_time.isoformat()
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    row_data = [
+        tf_name,
+        open_str,
+        float(last["open"]),
+        float(last["high"]),
+        float(last["low"]),
+        float(last["close"]),
+        float(last.get("volume", float("nan"))),
+        float(last.get("ema20", float("nan"))),
+        float(last.get("ema50", float("nan"))),
+        now_str,
+    ]
+
+    try:
+        values = ws.get_all_values()
+        for i, row in enumerate(values, start=1):
+            if row and row[0] == tf_name:
+                ws.update(f"A{i}:J{i}", [row_data])
+                return
+        # chưa có → append
+        ws.append_row(row_data)
+    except Exception as e:
+        _log(f"upsert_tf_candle error: {e}")
 
 
 def fetch_okx_candles(tf: str, limit: int = 120) -> pd.DataFrame:
@@ -148,6 +258,55 @@ def detect_trend_from_ema(last_row: pd.Series) -> str:
     if close < ema50 and ema20 < ema50:
         return "DOWN"
     return "SIDE"
+
+
+# ========================
+#  Candles fetch with cache (15m, 30m, 1H, 2H, 4H)
+# ========================
+
+def get_tf_df_with_cache(tf_name: str, ws_candles, now_utc: datetime, limit: int = 120) -> pd.DataFrame:
+    """
+    Lấy DataFrame nến từ OKX, nhưng ưu tiên dùng cache CANDLES.
+    - 15m: luôn fetch OKX đầy đủ để phân tích, đồng thời upsert cache (ghi 1 dòng cuối).
+    - 30m/1H/2H/4H: nếu cache đã có nến *đã đóng gần nhất* -> dùng cache (1 dòng);
+      nếu đã sang nến mới hoặc chưa có cache -> fetch OKX, tính EMA, rồi ghi cache.
+    """
+    tf_minutes = TIMEFRAME_MINUTES[tf_name]
+    expected_open = get_last_closed_open_time(now_utc, tf_minutes)
+
+    # 15m: luôn gọi OKX để có full dữ liệu phân tích
+    if tf_name == "15m":
+        df = fetch_okx_candles(TIMEFRAMES[tf_name], limit=limit)
+        df["ema20"] = ema(df["close"], 20)
+        df["ema50"] = ema(df["close"], 50)
+        if ws_candles is not None:
+            try:
+                upsert_tf_candle(ws_candles, tf_name, df)
+            except Exception as e:
+                _log(f"upsert 15m candle error: {e}")
+        return df
+
+    # các khung lớn: thử dùng cache
+    if ws_candles is not None:
+        cached = read_cached_tf_candle(ws_candles, tf_name)
+        if cached is not None:
+            cached_open, data = cached
+            if cached_open == expected_open:
+                # tạo df 1 dòng từ cache
+                s = pd.Series(data, name=cached_open)
+                df_cached = pd.DataFrame([s])
+                return df_cached
+
+    # không có cache phù hợp -> fetch OKX
+    df = fetch_okx_candles(TIMEFRAMES[tf_name], limit=limit)
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    if ws_candles is not None:
+        try:
+            upsert_tf_candle(ws_candles, tf_name, df)
+        except Exception as e:
+            _log(f"upsert {tf_name} candle error: {e}")
+    return df
 
 
 def _detect_swings(
@@ -622,14 +781,12 @@ def compute_signal_score(
 #  Core analysis
 # ========================
 
-def analyze_and_build_message() -> (str, str):
+def analyze_and_build_message(ws_candles=None) -> (str, str):
     now_utc = datetime.now(timezone.utc)
     session_type = get_session_type(now_utc)
 
-    # 1) Lấy nến 15m (khung trade chính)
-    df15 = fetch_okx_candles(TIMEFRAMES["15m"], limit=200)
-    df15["ema20"] = ema(df15["close"], 20)
-    df15["ema50"] = ema(df15["close"], 50)
+    # 1) Lấy nến 15m (khung trade chính) – dùng cache (ghi CANDLES, nhưng luôn fetch OKX)
+    df15 = get_tf_df_with_cache("15m", ws_candles, now_utc, limit=200)
     df15["atr14"] = calc_atr(df15, 14)
     df15["rsi14"] = rsi(df15["close"], 14)
     df15["vol_ma20"] = df15["volume"].rolling(window=20).mean()
@@ -669,15 +826,13 @@ def analyze_and_build_message() -> (str, str):
     rsi_5 = float(last5["rsi14"]) if not math.isnan(last5["rsi14"]) else float("nan")
     atr_5 = float(last5["atr14"]) if not math.isnan(last5["atr14"]) else float("nan")
 
-    # 2) Lấy nến higher TF & trend
+    # 2) Lấy nến higher TF & trend (ưu tiên cache cho 30m/1H/2H/4H)
     tf_trends = {}
     for name in ["30m", "1H", "2H", "4H"]:
-        df = fetch_okx_candles(TIMEFRAMES[name], limit=120)
-        df["ema20"] = ema(df["close"], 20)
-        df["ema50"] = ema(df["close"], 50)
+        df_htf = get_tf_df_with_cache(name, ws_candles, now_utc, limit=120)
         tf_trends[name] = {
-            "trend": detect_trend_from_ema(df.iloc[-1]),
-            "close": float(df.iloc[-1]["close"]),
+            "trend": detect_trend_from_ema(df_htf.iloc[-1]),
+            "close": float(df_htf.iloc[-1]["close"]),
         }
 
     # chọn trend chính: ưu tiên 4H, rồi 2H, 1H, 30m
@@ -1008,7 +1163,7 @@ def analyze_and_build_message() -> (str, str):
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
     msg_lines.append("*Trend higher timeframe:*")
-    msg_lines.append(f"- 30m: {tf_trends['30m']['trend']} (Close: {tf_trends['30m']['close']:,.2f})")
+    msg_lines.append(f"- Trend 30m: {tf_trends['30m']['trend']} (Close: {tf_trends['30m']['close']:,.2f})")
     msg_lines.append(f"- 1H: {tf_trends['1H']['trend']} (Close: {tf_trends['1H']['close']:,.2f})")
     msg_lines.append(f"- 2H: {tf_trends['2H']['trend']} (Close: {tf_trends['2H']['close']:,.2f})")
     msg_lines.append(f"- 4H: {tf_trends['4H']['trend']} (Close: {tf_trends['4H']['close']:,.2f})")
@@ -1098,20 +1253,24 @@ def analyze_and_build_message() -> (str, str):
 def main():
     _log("Start BTC analyzer bot...")
 
-    # build message + state_key
-    try:
-        text, state_key = analyze_and_build_message()
-    except Exception as e:
-        _log(f"Analyze error: {e}")
-        return
+    sh = None
+    ws_cache = None
+    ws_candles = None
 
-    # connect sheet for anti-spam
+    # Kết nối Google Sheet + lấy BT_CACHE & CANDLES
     try:
         sh = connect_gsheet()
         ws_cache = get_or_create_worksheet(sh, "BT_CACHE", rows=10, cols=2)
+        ws_candles = get_candles_ws(sh)
     except Exception as e:
         _log(f"Google Sheet error: {e}")
-        ws_cache = None
+
+    # build message + state_key (truyền ws_candles để dùng cache nến)
+    try:
+        text, state_key = analyze_and_build_message(ws_candles=ws_candles)
+    except Exception as e:
+        _log(f"Analyze error: {e}")
+        return
 
     new_hash = compute_message_hash(state_key)
     old_hash = None
