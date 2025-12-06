@@ -1008,7 +1008,7 @@ def analyze_and_build_message() -> (str, str):
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
     msg_lines.append("*Trend higher timeframe:*")
-    msg_lines.append(f"- Trend 30m: {tf_trends['30m']['trend']} (Close: {tf_trends['30m']['close']:,.2f})")
+    msg_lines.append(f"- 30m: {tf_trends['30m']['trend']} (Close: {tf_trends['30m']['close']:,.2f})")
     msg_lines.append(f"- 1H: {tf_trends['1H']['trend']} (Close: {tf_trends['1H']['close']:,.2f})")
     msg_lines.append(f"- 2H: {tf_trends['2H']['trend']} (Close: {tf_trends['2H']['close']:,.2f})")
     msg_lines.append(f"- 4H: {tf_trends['4H']['trend']} (Close: {tf_trends['4H']['close']:,.2f})")
@@ -1030,7 +1030,7 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append("⚠ Có nến biến động >3×ATR (giống nến tin tức) trong 1–2 nến gần đây – nên cẩn trọng với tín hiệu.")
     msg_lines.append("")
     msg_lines.append(f"- {get_session_note(now_utc)}")
-    msg_lines.append(f"- Phiên hiện tại: {session_type}")
+    #msg_lines.append(f"- Phiên hiện tại: {session_type}")
     msg_lines.append("")
 
     if retrace_info["zones"]:
@@ -1061,7 +1061,7 @@ def analyze_and_build_message() -> (str, str):
         if "NO TRADE" in score_comment or "quan sát" in score_comment:
             msg_lines.append("⚠ Dù có tín hiệu, *điểm chất lượng thấp* hoặc bối cảnh nhiễu nên ưu tiên QUAN SÁT, chưa gợi ý lệnh cụ thể.")
         else:
-            msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh cụ thể (NO TRADE hoặc tránh vào trễ).")
+            msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
 
     # === TẠO state_key cho logic chống spam ===
     state_parts = [
