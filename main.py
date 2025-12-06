@@ -1228,11 +1228,6 @@ def analyze_and_build_message(ws_candles=None) -> (str, str):
         signal,
         regime,
         atr_text,
-        session_type,
-        int(tri_score / 10),
-        int(trend_score / 5),
-        int(momentum_score / 5),
-        int(location_score / 5),
         int(news_like),
     ]
 
