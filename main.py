@@ -27,9 +27,10 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-EXNESS_PRICE_URL = os.getenv("EXNESS_PRICE_URL")  # REST endpoint trả JSON giá Exness hiện tại
+EXNESS_PRICE_URL = os.getenv("EXNESS_PRICE_URL")  # endpoint trả JSON giá Exness
 
 TIMEFRAMES = {
+    "5m": "5m",
     "15m": "15m",
     "30m": "30m",
     "1H": "1H",
@@ -202,7 +203,6 @@ def get_exness_price() -> Optional[float]:
         r = requests.get(EXNESS_PRICE_URL, timeout=5)
         r.raise_for_status()
         data = r.json()
-        # cố gắng tìm key giá
         if isinstance(data, dict):
             for key in ["price", "last", "ask", "bid"]:
                 if key in data and isinstance(data[key], (int, float)):
@@ -243,12 +243,10 @@ def get_retrace_zones(direction: str, last_close: float, atr: float) -> Dict[str
 
     zones = []
     if direction == "up":
-        # 3 vùng kháng cự phía trên
         zones.append(("Vùng 1", last_close + 0.3 * atr, last_close + 0.6 * atr))
         zones.append(("Vùng 2", last_close + 0.6 * atr, last_close + 0.9 * atr))
         zones.append(("Vùng 3 (thấp)", last_close + 0.1 * atr, last_close + 0.3 * atr))
     else:
-        # 3 vùng hỗ trợ phía dưới
         zones.append(("Vùng 1", last_close - 0.6 * atr, last_close - 0.3 * atr))
         zones.append(("Vùng 2", last_close - 0.9 * atr, last_close - 0.6 * atr))
         zones.append(("Vùng 3 (cao)", last_close - 0.3 * atr, last_close - 0.1 * atr))
@@ -346,10 +344,10 @@ def send_telegram_message(text: str) -> None:
 #  Core analysis
 # ========================
 
-def analyze_and_build_message() -> str:
+def analyze_and_build_message() -> (str, str):
     now_utc = datetime.now(timezone.utc)
 
-    # 1) Lấy nến 15m
+    # 1) Lấy nến 15m (khung trade chính)
     df15 = fetch_okx_candles(TIMEFRAMES["15m"], limit=200)
     df15["ema20"] = ema(df15["close"], 20)
     df15["ema50"] = ema(df15["close"], 50)
@@ -367,6 +365,22 @@ def analyze_and_build_message() -> str:
     prev_rsi_15 = float(df15["rsi14"].iloc[-2]) if not math.isnan(df15["rsi14"].iloc[-2]) else float("nan")
     regime = detect_regime(rsi_15, atr_15)
     trend_15 = detect_trend_from_ema(last15)
+
+    # Độ tuổi nến 15m (để tránh vào lệnh hồi quá trễ)
+    last15_ts = df15.index[-1]
+    frame_seconds_15 = 15 * 60
+    age_seconds_15 = max(0.0, (now_utc - last15_ts).total_seconds())
+    bar_age_ratio_15 = min(1.0, age_seconds_15 / frame_seconds_15)
+
+    # 1b) Lấy thêm khung 5m để phát hiện hồi kỹ thuật SỚM
+    df5 = fetch_okx_candles(TIMEFRAMES["5m"], limit=200)
+    df5["rsi14"] = rsi(df5["close"], 14)
+    df5["atr14"] = calc_atr(df5, 14)
+    last5 = df5.iloc[-1]
+    prev5 = df5.iloc[-2]
+    prev5_2 = df5.iloc[-3]
+    rsi_5 = float(last5["rsi14"]) if not math.isnan(last5["rsi14"]) else float("nan")
+    atr_5 = float(last5["atr14"]) if not math.isnan(last5["atr14"]) else float("nan")
 
     # 2) Lấy nến higher TF & trend
     tf_trends = {}
@@ -406,34 +420,38 @@ def analyze_and_build_message() -> str:
     else:
         diff = exness_last - okx_last_price
 
-    # 5) Một số flag nến 15m
+    # 5) Một số flag nến (dùng cho cả 15m & 5m)
     def is_bull(row):
         return row["close"] > row["open"]
 
     def is_bear(row):
         return row["close"] < row["open"]
 
-    three_bull = (
+    three_bull_15 = (
         is_bull(last15) and is_bull(prev1) and is_bull(prev2)
         and last15["close"] > prev1["close"] > prev2["close"]
     )
-    three_bear = (
+    three_bear_15 = (
         is_bear(last15) and is_bear(prev1) and is_bear(prev2)
         and last15["close"] < prev1["close"] < prev2["close"]
     )
 
-    true_range = last15["high"] - last15["low"]
-    big_move = (not math.isnan(atr_15)) and (true_range > 1.0 * atr_15)
-    moderate_move = (not math.isnan(atr_15)) and (true_range > 0.8 * atr_15)
+    true_range_15 = last15["high"] - last15["low"]
+    big_move_15 = (not math.isnan(atr_15)) and (true_range_15 > 1.0 * atr_15)
+    moderate_move_15 = (not math.isnan(atr_15)) and (true_range_15 > 0.8 * atr_15)
 
-    vol = float(last15["volume"])
-    vol_ma20 = float(last15["vol_ma20"]) if not math.isnan(last15["vol_ma20"]) else 0.0
-    vol_ok = (vol_ma20 == 0) or (vol > 1.1 * vol_ma20)
+    vol_15 = float(last15["volume"])
+    vol_ma20_15 = float(last15["vol_ma20"]) if not math.isnan(last15["vol_ma20"]) else 0.0
+    vol_ok_15 = (vol_ma20_15 == 0) or (vol_15 > 1.1 * vol_ma20_15)
 
-    rsi_val = rsi_15
+    # 5b) Cờ cho 5m (phát hiện hồi sớm)
+    last3_5 = [last5, prev5, prev5_2]
+    bull_count_5 = sum(1 for r in last3_5 if is_bull(r))
+    bear_count_5 = sum(1 for r in last3_5 if is_bear(r))
+    change_5 = float(last5["close"] - prev5_2["close"])
 
     # =========
-    #  Logic tín hiệu: LONG/SHORT MẠNH & HỒI KỸ THUẬT
+    #  Logic tín hiệu: LONG/SHORT MẠNH & HỒI KỸ THUẬT (có early 5m)
     # =========
     force = "Trung lập"
     signal = "Không rõ"
@@ -458,6 +476,8 @@ def analyze_and_build_message() -> str:
         and ms_30m_is_up
     )
 
+    rsi_val = rsi_15
+
     # ========== DOWN TREND ==========
     if main_trend == "DOWN":
         # kiểm tra rơi xa EMA20 để tránh short đuổi đáy
@@ -466,44 +486,53 @@ def analyze_and_build_message() -> str:
             dist_from_ema20 = last15["ema20"] - last15["close"]
             extended_down = dist_from_ema20 > 0.8 * atr_15
 
-        # điều kiện HỒI KỸ THUẬT (LONG)
-        strong_two_bull = (
+        # điều kiện HỒI KỸ THUẬT (15m)
+        strong_two_bull_15 = (
             is_bull(last15)
             and is_bull(prev1)
-            and ( (last15["high"] - last15["low"]) > 0.8 * atr_15 )
-            and ( (prev1["high"] - prev1["low"]) > 0.8 * atr_15 )
-            and vol_ok
+            and ((last15["high"] - last15["low"]) > 0.8 * atr_15)
+            and ((prev1["high"] - prev1["low"]) > 0.8 * atr_15)
+            and vol_ok_15
             and (not math.isnan(rsi_val) and rsi_val > 40)
             and (not math.isnan(prev_rsi_15) and prev_rsi_15 < 35)
         )
-        three_bull_retrace = (
-            three_bull
+        three_bull_retrace_15 = (
+            three_bull_15
             and last15["close"] >= last15["ema20"]
         )
 
-        is_tech_retrace_long = strong_two_bull or three_bull_retrace
+        # điều kiện HỒI KỸ THUẬT SỚM (5m)
+        early_long_retrace_5m = (
+            bull_count_5 >= 2
+            and not math.isnan(rsi_5)
+            and rsi_5 > 45
+            and (atr_15 > 0 and change_5 > 0.4 * atr_15)
+        )
+
+        is_tech_retrace_long = strong_two_bull_15 or three_bull_retrace_15 or early_long_retrace_5m
 
         if is_tech_retrace_long:
-            force = "Nhịp hồi kỹ thuật rõ ràng trong Downtrend (3 nến hoặc 2 nến mạnh)"
+            if early_long_retrace_5m and not (strong_two_bull_15 or three_bull_retrace_15):
+                force = "Nhịp hồi kỹ thuật SỚM trong Downtrend (dựa trên khung 5m)."
+            else:
+                force = "Nhịp hồi kỹ thuật rõ ràng trong Downtrend (3 nến hoặc 2 nến mạnh)."
             signal = "LONG hồi kỹ thuật"
 
         else:
             # nếu không phải hồi rõ, xét SHORT mạnh nếu đủ điều kiện
-            if can_strong_short and is_bear(last15) and last15["close"] < last15["ema20"] < last15["ema50"] and big_move and vol_ok:
+            if can_strong_short and is_bear(last15) and last15["close"] < last15["ema20"] < last15["ema50"] and big_move_15 and vol_ok_15:
                 if extended_down or (not math.isnan(rsi_val) and rsi_val < 25):
-                    # đủ điều kiện trend nhưng đã rơi quá sâu / quá bán -> chờ hồi
                     force = "Giá đã rơi sâu xa EMA, dễ có nhịp hồi kỹ thuật"
                     signal = "Chờ SHORT lại"
                 else:
                     force = "Lực bán chiếm ưu thế, Downtrend mạnh"
                     signal = "SHORT mạnh"
             else:
-                # không đủ điều kiện mạnh -> chỉ nhận diện hồi nhẹ hoặc nhiễu
                 if extended_down or (not math.isnan(rsi_val) and rsi_val < 30):
                     force = "Nhịp hồi/sideway sau pha rơi sâu – có thể đánh LONG hồi nhỏ"
                     signal = "LONG hồi kỹ thuật"
                 else:
-                    force = "Downtrend nhưng tín hiệu 15m chưa rõ – nên quan sát thêm"
+                    force = "Thị trường đang nhiễu trong Downtrend yếu/sideway"
                     signal = "Không rõ"
 
     # ========== UP TREND ==========
@@ -514,30 +543,41 @@ def analyze_and_build_message() -> str:
             dist_from_ema20 = last15["close"] - last15["ema20"]
             extended_up = dist_from_ema20 > 0.8 * atr_15
 
-        # điều kiện HỒI KỸ THUẬT (SHORT)
-        strong_two_bear = (
+        # điều kiện HỒI KỸ THUẬT (15m)
+        strong_two_bear_15 = (
             is_bear(last15)
             and is_bear(prev1)
-            and ( (last15["high"] - last15["low"]) > 0.8 * atr_15 )
-            and ( (prev1["high"] - prev1["low"]) > 0.8 * atr_15 )
-            and vol_ok
+            and ((last15["high"] - last15["low"]) > 0.8 * atr_15)
+            and ((prev1["high"] - prev1["low"]) > 0.8 * atr_15)
+            and vol_ok_15
             and (not math.isnan(rsi_val) and rsi_val < 60)
             and (not math.isnan(prev_rsi_15) and prev_rsi_15 > 65)
         )
-        three_bear_retrace = (
-            three_bear
+        three_bear_retrace_15 = (
+            three_bear_15
             and last15["close"] <= last15["ema20"]
         )
 
-        is_tech_retrace_short = strong_two_bear or three_bear_retrace
+        # điều kiện HỒI KỸ THUẬT SỚM (5m)
+        early_short_retrace_5m = (
+            bear_count_5 >= 2
+            and not math.isnan(rsi_5)
+            and rsi_5 < 55
+            and (atr_15 > 0 and -change_5 > 0.4 * atr_15)
+        )
+
+        is_tech_retrace_short = strong_two_bear_15 or three_bear_retrace_15 or early_short_retrace_5m
 
         if is_tech_retrace_short:
-            force = "Nhịp điều chỉnh giảm (hồi kỹ thuật) rõ ràng trong Uptrend"
+            if early_short_retrace_5m and not (strong_two_bear_15 or three_bear_retrace_15):
+                force = "Nhịp điều chỉnh giảm SỚM trong Uptrend (dựa trên khung 5m)."
+            else:
+                force = "Nhịp điều chỉnh giảm (hồi kỹ thuật) rõ ràng trong Uptrend."
             signal = "SHORT hồi kỹ thuật"
 
         else:
             # không phải hồi rõ -> xét LONG mạnh nếu đủ điều kiện
-            if can_strong_long and is_bull(last15) and last15["close"] > last15["ema20"] > last15["ema50"] and big_move and vol_ok:
+            if can_strong_long and is_bull(last15) and last15["close"] > last15["ema20"] > last15["ema50"] and big_move_15 and vol_ok_15:
                 if extended_up or (not math.isnan(rsi_val) and rsi_val > 75):
                     force = "Giá đã kéo xa EMA, dễ có nhịp điều chỉnh giảm"
                     signal = "Chờ LONG lại"
@@ -549,7 +589,7 @@ def analyze_and_build_message() -> str:
                     force = "Nhịp điều chỉnh/sideway sau pha tăng mạnh – có thể SHORT hồi nhỏ"
                     signal = "SHORT hồi kỹ thuật"
                 else:
-                    force = "Uptrend nhưng tín hiệu 15m chưa rõ – nên quan sát thêm"
+                    force = "Thị trường đang nhiễu trong Uptrend yếu/sideway"
                     signal = "Không rõ"
 
     # ========== Không rõ trend (SIDE / MIXED) ==========
@@ -574,13 +614,18 @@ def analyze_and_build_message() -> str:
     if signal in ["SHORT mạnh", "LONG mạnh", "LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"]:
         trade_signal = signal
     elif signal == "Chờ SHORT lại":
-        # view downtrend, nhưng lệnh thực tế ưu tiên LONG hồi kỹ thuật
         trade_signal = "LONG hồi kỹ thuật"
     elif signal == "Chờ LONG lại":
         trade_signal = "SHORT hồi kỹ thuật"
 
+    # Bảo vệ: nếu là hồi kỹ thuật nhưng nến 15m đã chạy > 70% thời gian
+    late_retrace = False
+    if trade_signal in ["LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"] and bar_age_ratio_15 > 0.7:
+        late_retrace = True
+        force += " – Nhịp hồi đã đi được phần lớn cây nến, hạn chế vào lệnh mới (tránh vào trễ)."
+
     trade = None
-    if trade_signal is not None:
+    if trade_signal is not None and not late_retrace:
         trade = build_trade_suggestion(trade_signal, last15, atr_15)
 
     # 8) Build message
@@ -623,8 +668,6 @@ def analyze_and_build_message() -> str:
             msg_lines.append(f"• {label}: {z_low:,.2f} – {z_high:,.2f}")
         msg_lines.append("")
 
-        # ... (đoạn build msg_lines giữ nguyên như cũ)
-
     if trade:
         ex_entry = to_exness_price(trade["entry"], diff)
         ex_tp = to_exness_price(trade["tp"], diff)
@@ -632,16 +675,16 @@ def analyze_and_build_message() -> str:
 
         msg_lines.append("🎯 *Gợi ý lệnh (15m – trend & hồi kỹ thuật):*")
         msg_lines.append(f"- Lệnh: *{trade['side']}* ({trade_signal})")
-        msg_lines.append("")
-        msg_lines.append(f"- Entry OKX: {trade['entry']:,.1f}")
-        msg_lines.append(f"- TP OKX: {trade['tp']:,.1f}")
-        msg_lines.append(f"- SL OKX: {trade['sl']:,.1f}")
+        #msg_lines.append("")
+        #msg_lines.append(f"- Entry OKX: {trade['entry']:,.1f}")
+        #msg_lines.append(f"- TP OKX: {trade['tp']:,.1f}")
+        #msg_lines.append(f"- SL OKX: {trade['sl']:,.1f}")
         msg_lines.append("")
         msg_lines.append(f"- Entry EXNESS: {ex_entry:,.1f}")
         msg_lines.append(f"- TP EXNESS: {ex_tp:,.1f}")
         msg_lines.append(f"- SL EXNESS: {ex_sl:,.1f}")
     else:
-        msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh cụ thể (NO TRADE).")
+        msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh cụ thể (NO TRADE hoặc tránh vào trễ).")
 
     # === TẠO state_key cho logic chống spam ===
     state_parts = [
@@ -656,7 +699,6 @@ def analyze_and_build_message() -> str:
     ]
 
     if trade:
-        # làm tròn cho đỡ nhạy với vài đô
         state_parts += [
             trade_signal,
             trade["side"],
@@ -680,7 +722,6 @@ def main():
         _log(f"Analyze error: {e}")
         return
 
-
     # connect sheet for anti-spam
     try:
         sh = connect_gsheet()
@@ -693,8 +734,9 @@ def main():
     old_hash = None
     if ws_cache is not None:
         old_hash = sheet_read_last_message_hash(ws_cache)
+
     if old_hash == new_hash:
-        _log("Message unchanged from last run -> skip Telegram (avoid spam).")
+        _log("State unchanged from last run -> skip Telegram (avoid spam).")
         return
 
     send_telegram_message(text)
@@ -702,7 +744,7 @@ def main():
 
     if ws_cache is not None:
         sheet_write_last_message_hash(ws_cache, new_hash)
-        _log("Updated message hash in BT_CACHE.")
+        _log("Updated state hash in BT_CACHE.")
 
 
 if __name__ == "__main__":
