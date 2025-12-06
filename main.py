@@ -1038,7 +1038,7 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append("⚠ Có nến biến động >3×ATR (giống nến tin tức) trong 1–2 nến gần đây (30m hoặc 15m) – nên cẩn trọng với tín hiệu.")
     msg_lines.append("")
     msg_lines.append(f"- {get_session_note(now_utc)}")
-    msg_lines.append(f"- Phiên hiện tại: {session_type}")
+    #msg_lines.append(f"- Phiên hiện tại: {session_type}")
     msg_lines.append("")
 
     if retrace_info["zones"]:
