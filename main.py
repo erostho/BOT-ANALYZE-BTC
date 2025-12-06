@@ -1257,10 +1257,10 @@ def main():
     ws_cache = None
     ws_candles = None
 
-    # Kết nối Google Sheet + lấy BT_CACHE & CANDLES
+    # Kết nối Google Sheet + lấy STATE & CANDLES
     try:
         sh = connect_gsheet()
-        ws_cache = get_or_create_worksheet(sh, "BT_CACHE", rows=10, cols=2)
+        ws_cache = get_or_create_worksheet(sh, "STATE", rows=10, cols=2)
         ws_candles = get_candles_ws(sh)
     except Exception as e:
         _log(f"Google Sheet error: {e}")
@@ -1286,7 +1286,7 @@ def main():
 
     if ws_cache is not None:
         sheet_write_last_message_hash(ws_cache, new_hash)
-        _log("Updated state hash in BT_CACHE.")
+        _log("Updated state hash in STATE.")
 
 
 if __name__ == "__main__":
