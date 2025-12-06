@@ -4,7 +4,7 @@ import math
 import time
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 import pandas as pd
@@ -150,34 +150,79 @@ def detect_trend_from_ema(last_row: pd.Series) -> str:
     return "SIDE"
 
 
-def classify_market_structure(df: pd.DataFrame, lookback: int = 30) -> str:
+def _detect_swings(df: pd.DataFrame, lookback: int = 60, left: int = 2, right: int = 2) -> Tuple[List[Tuple[pd.Timestamp, float]], List[Tuple[pd.Timestamp, float]]]:
     """
-    Rất đơn giản: so sánh đỉnh/đáy gần đây.
-    Trả về: "Tăng (HH–HL)", "Giảm (LH–LL)", "Sideway / lẫn lộn"
+    Tìm swing high / swing low dạng fractal:
+    - swing high: high[i] > high[i-k] & high[i] > high[i+k] (k=1..left/right)
+    - swing low  : low[i]  < low[i-k] & low[i]  < low[i+k]
+    Chỉ dùng phần đuôi 'lookback' để nhẹ.
     """
     sub = df.tail(lookback)
     highs = sub["high"]
     lows = sub["low"]
+    idx = list(sub.index)
+
+    swing_highs: List[Tuple[pd.Timestamp, float]] = []
+    swing_lows: List[Tuple[pd.Timestamp, float]] = []
 
     n = len(sub)
-    if n < 10:
-        return "Không rõ (thiếu dữ liệu)"
+    for i in range(left, n - right):
+        h = highs.iloc[i]
+        l = lows.iloc[i]
+        ok_high = True
+        ok_low = True
+        for k in range(1, left + 1):
+            if h <= highs.iloc[i - k]:
+                ok_high = False
+                break
+        for k in range(1, right + 1):
+            if h <= highs.iloc[i + k]:
+                ok_high = False
+                break
+        for k in range(1, left + 1):
+            if l >= lows.iloc[i - k]:
+                ok_low = False
+                break
+        for k in range(1, right + 1):
+            if l >= lows.iloc[i + k]:
+                ok_low = False
+                break
 
-    block = n // 3
-    h1 = highs.iloc[:block].max()
-    h2 = highs.iloc[block:2 * block].max()
-    h3 = highs.iloc[2 * block:].max()
+        ts = idx[i]
+        if ok_high:
+            swing_highs.append((ts, float(h)))
+        if ok_low:
+            swing_lows.append((ts, float(l)))
 
-    l1 = lows.iloc[:block].min()
-    l2 = lows.iloc[block:2 * block].min()
-    l3 = lows.iloc[2 * block:].min()
+    return swing_highs, swing_lows
 
-    if h3 > h2 > h1 and l3 > l2 > l1:
+
+def classify_market_structure(df: pd.DataFrame, lookback: int = 80) -> str:
+    """
+    Phân loại cấu trúc thị trường bằng swing high/low:
+    - Tăng (HH–HL): ít nhất 3 swing high & 3 swing low, cả hai đều tăng dần ở 3 điểm cuối
+    - Giảm (LH–LL): tương tự nhưng giảm dần
+    - Ngược lại: Sideway / lẫn lộn
+    """
+    swing_highs, swing_lows = _detect_swings(df, lookback=lookback)
+
+    if len(swing_highs) < 3 or len(swing_lows) < 3:
+        return "Không rõ (thiếu swing)"
+
+    last_highs = [p for _, p in swing_highs[-3:]]
+    last_lows = [p for _, p in swing_lows[-3:]]
+
+    def _is_increasing(vals: List[float]) -> bool:
+        return vals[0] < vals[1] < vals[2]
+
+    def _is_decreasing(vals: List[float]) -> bool:
+        return vals[0] > vals[1] > vals[2]
+
+    if _is_increasing(last_highs) and _is_increasing(last_lows):
         return "Tăng (HH–HL)"
-    elif h3 < h2 < h1 and l3 < l2 < l1:
+    if _is_decreasing(last_highs) and _is_decreasing(last_lows):
         return "Giảm (LH–LL)"
-    else:
-        return "Sideway / lẫn lộn"
+    return "Sideway / lẫn lộn"
 
 
 def classify_atr(atr_value: float) -> str:
@@ -341,6 +386,87 @@ def send_telegram_message(text: str) -> None:
 
 
 # ========================
+#  Signal quality scoring
+# ========================
+
+def compute_signal_score(
+    main_trend: str,
+    trend_15: str,
+    ms_15m: str,
+    ms_30m: str,
+    rsi_15: float,
+    atr_15: float,
+    last15: pd.Series,
+    prev1: pd.Series,
+    prev2: pd.Series,
+    vol_ma20_15: float,
+    trade_signal: Optional[str],
+) -> Tuple[int, int, int, int]:
+    """
+    Chấm điểm chất lượng tín hiệu:
+    - Trend score  (0–40)
+    - Momentum     (0–30)
+    - Location     (0–30)
+    Tổng: 0–100
+    """
+    trend_score = 0
+    momentum_score = 0
+    location_score = 0
+
+    # --- Trend score ---
+    if main_trend in ("UP", "DOWN") and trend_15 == main_trend:
+        trend_score += 15
+
+    if ("Tăng" in ms_15m and main_trend == "UP") or ("Giảm" in ms_15m and main_trend == "DOWN"):
+        trend_score += 10
+    if ("Tăng" in ms_30m and main_trend == "UP") or ("Giảm" in ms_30m and main_trend == "DOWN"):
+        trend_score += 10
+
+    if not math.isnan(rsi_15):
+        if main_trend == "UP" and rsi_15 >= 55:
+            trend_score += 5
+        elif main_trend == "DOWN" and rsi_15 <= 45:
+            trend_score += 5
+
+    # --- Momentum score ---
+    true_range_15 = float(last15["high"] - last15["low"]) if not math.isnan(last15["high"] - last15["low"]) else 0.0
+    if atr_15 > 0:
+        if true_range_15 >= 0.8 * atr_15:
+            momentum_score += 10
+    vol_15 = float(last15["volume"])
+    if vol_ma20_15 > 0 and vol_15 >= 1.2 * vol_ma20_15:
+        momentum_score += 10
+
+    prev_highs = max(prev1["high"], prev2["high"])
+    prev_lows = min(prev1["low"], prev2["low"])
+    broke_high = last15["high"] > prev_highs
+    broke_low = last15["low"] < prev_lows
+
+    if trade_signal in ("LONG mạnh", "LONG hồi kỹ thuật") and broke_high:
+        momentum_score += 10
+    elif trade_signal in ("SHORT mạnh", "SHORT hồi kỹ thuật") and broke_low:
+        momentum_score += 10
+    elif broke_high or broke_low:
+        momentum_score += 5  # có phá range nhưng không khớp hẳn hướng trade
+
+    # --- Location score ---
+    if atr_15 > 0:
+        dist_ema20 = abs(float(last15["close"] - last15["ema20"]))
+        # càng gần EMA20 càng tốt
+        if dist_ema20 <= 0.7 * atr_15:
+            location_score += 15
+        elif dist_ema20 <= 1.0 * atr_15:
+            location_score += 8
+
+    # ưu tiên tín hiệu hồi kỹ thuật có vị trí đẹp (sau pha kéo/rơi mạnh)
+    if trade_signal in ("LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"):
+        location_score += 10
+
+    total = trend_score + momentum_score + location_score
+    return trend_score, momentum_score, location_score, total
+
+
+# ========================
 #  Core analysis
 # ========================
 
@@ -401,7 +527,7 @@ def analyze_and_build_message() -> (str, str):
             main_trend = t
             break
 
-    # 3) Market structure 15m & 30m
+    # 3) Market structure 15m & 30m (bằng swing high/low)
     ms_15m = classify_market_structure(df15)
     df30 = fetch_okx_candles(TIMEFRAMES["30m"], limit=120)
     ms_30m = classify_market_structure(df30)
@@ -610,7 +736,7 @@ def analyze_and_build_message() -> (str, str):
         retrace_info = {"direction": None, "zones": []}
 
     # 7) Gợi ý lệnh: map signal hiển thị -> trade_signal thực sự
-    trade_signal = None
+    trade_signal: Optional[str] = None
     if signal in ["SHORT mạnh", "LONG mạnh", "LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"]:
         trade_signal = signal
     elif signal == "Chờ SHORT lại":
@@ -624,16 +750,41 @@ def analyze_and_build_message() -> (str, str):
         late_retrace = True
         force += " – Nhịp hồi đã đi được phần lớn cây nến, hạn chế vào lệnh mới (tránh vào trễ)."
 
-    trade = None
-    if trade_signal is not None and not late_retrace:
+    # 7b) Tính Signal Score (trend/momentum/location)
+    trend_score = momentum_score = location_score = total_score = 0
+    if trade_signal is not None:
+        trend_score, momentum_score, location_score, total_score = compute_signal_score(
+            main_trend=main_trend,
+            trend_15=trend_15,
+            ms_15m=ms_15m,
+            ms_30m=ms_30m,
+            rsi_15=rsi_15,
+            atr_15=atr_15,
+            last15=last15,
+            prev1=prev1,
+            prev2=prev2,
+            vol_ma20_15=vol_ma20_15,
+            trade_signal=trade_signal,
+        )
+
+    # 7c) Gating: chỉ tạo lệnh khi score >= 60 và không bị late_retrace
+    trade: Optional[Dict[str, Any]] = None
+    score_comment = ""
+    if trade_signal is not None and not late_retrace and total_score >= 60:
         trade = build_trade_suggestion(trade_signal, last15, atr_15)
+        if total_score < 75:
+            score_comment = f"Điểm chất lượng tín hiệu: {total_score}/100 (Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – *tín hiệu KHÁ*, nên vào size vừa phải."
+        else:
+            score_comment = f"Điểm chất lượng tín hiệu: {total_score}/100 (Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – *tín hiệu MẠNH*, có thể cân nhắc vào lệnh chuẩn size."
+    elif trade_signal is not None and not late_retrace and total_score < 60:
+        score_comment = f"Điểm chất lượng tín hiệu: {total_score}/100 (Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – *dưới ngưỡng 60*, ưu tiên QUAN SÁT (NO TRADE)."
 
     # 8) Build message
     now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
     msg_lines: List[str] = []
     msg_lines.append("✅✅✅ *UPDATE INFO (BTC-USDT)*")
-    msg_lines.append(f"Tín hiệu: {signal}")
+    msg_lines.append(f"- *Tín hiệu:* {signal}")
     msg_lines.append(f"Thời gian: `{now_str}`")
     msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
     msg_lines.append("")
@@ -655,6 +806,8 @@ def analyze_and_build_message() -> (str, str):
     msg_lines.append(f"  → {atr_text}")
     if not math.isnan(rsi_15):
         msg_lines.append(f"- RSI14 15m: {rsi_15:.1f} – Chế độ thị trường: {regime}")
+    if score_comment:
+        msg_lines.append(f"- {score_comment}")
     msg_lines.append("")
     msg_lines.append(f"- {get_session_note(now_utc)}")
     msg_lines.append("")
@@ -684,7 +837,10 @@ def analyze_and_build_message() -> (str, str):
         msg_lines.append(f"- TP EXNESS: {ex_tp:,.1f}")
         msg_lines.append(f"- SL EXNESS: {ex_sl:,.1f}")
     else:
-        msg_lines.append("⚠ Hiện tín hiệu chưa đủ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
+        if "NO TRADE" in score_comment or "quan sát" in score_comment:
+            msg_lines.append("⚠ Dù có tín hiệu, *điểm chất lượng thấp* nên ưu tiên QUAN SÁT, chưa gợi ý lệnh cụ thể.")
+        else:
+            msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
 
     # === TẠO state_key cho logic chống spam ===
     state_parts = [
@@ -696,6 +852,10 @@ def analyze_and_build_message() -> (str, str):
         signal,
         regime,
         atr_text,
+        # thêm bucket của score để nếu score đổi nhiều thì mới gửi
+        int(trend_score / 5),
+        int(momentum_score / 5),
+        int(location_score / 5),
     ]
 
     if trade:
