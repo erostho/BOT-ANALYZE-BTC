@@ -1112,7 +1112,12 @@ def main():
     except Exception as e:
         _log(f"Analyze error: {e}")
         return
-
+        
+    # ⛔ Nếu tín hiệu là "Không rõ" thì bỏ qua, không gửi Telegram
+    # (dựa vào dòng "- *Tín hiệu:* Không rõ" trong message)
+    if "Tín hiệu:* Không rõ" in text or "Tín hiệu: Không rõ" in text:
+        _log("Signal = 'Không rõ' -> skip Telegram để tránh spam.")
+        return
     # connect sheet for anti-spam
     try:
         sh = connect_gsheet()
